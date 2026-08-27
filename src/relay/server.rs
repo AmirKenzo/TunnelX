@@ -95,6 +95,7 @@ fn spawn_public_listener(state: Arc<State>, name: String, remote_listen: String)
         info!(name = %name, listen = %remote_listen, "reverse tunnel public listener up");
 
         let mut accept_error_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
+        let mut no_client_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(p) => p,
@@ -110,7 +111,9 @@ fn spawn_public_listener(state: Arc<State>, name: String, remote_listen: String)
 
             let control = state.reverse_controls.lock().await.get(&name).cloned();
             let Some(control) = control else {
-                warn!(name = %name, peer = %peer, "no client connected for reverse tunnel, dropping connection");
+                if let Some(suppressed) = no_client_throttle.allow() {
+                    warn!(name = %name, peer = %peer, suppressed, "no client connected for reverse tunnel, dropping connection(s)");
+                }
                 continue;
             };
 
