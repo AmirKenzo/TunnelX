@@ -48,6 +48,8 @@ async fn main() -> Result<()> {
     let config = Config::load(&args.config)?;
     let log_handle = logging::init(config.log_level())?;
 
+    info!(version = env!("CARGO_PKG_VERSION"), "tunnelx starting");
+
     match config {
         Config::Direct(direct_config) => {
             info!(

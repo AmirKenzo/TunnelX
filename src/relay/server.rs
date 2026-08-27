@@ -20,8 +20,10 @@ struct State {
     /// tunnel name -> channel to push messages (mainly `NewConnection`) to that
     /// tunnel's currently-registered control connection writer task.
     reverse_controls: Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>,
-    /// conn_id -> the public TcpStream waiting to be paired with a data connection.
-    pending: Mutex<HashMap<u64, TcpStream>>,
+    /// conn_id -> the public TcpStream (plus its peer addr, captured at accept
+    /// time since it can't be reliably read back off the socket later) waiting
+    /// to be paired with a data connection.
+    pending: Mutex<HashMap<u64, (TcpStream, std::net::SocketAddr)>>,
     next_conn_id: AtomicU64,
 }
 
@@ -102,7 +104,7 @@ fn spawn_public_listener(state: Arc<State>, name: String, remote_listen: String)
             };
 
             let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
-            state.pending.lock().await.insert(conn_id, stream);
+            state.pending.lock().await.insert(conn_id, (stream, peer));
 
             if control.send(Message::NewConnection { conn_id }).is_err() {
                 state.pending.lock().await.remove(&conn_id);
@@ -244,14 +246,14 @@ async fn handle_forward_conn(
 }
 
 async fn handle_data_conn(state: Arc<State>, mut stream: BoxedStream, conn_id: u64) -> Result<()> {
-    let Some(mut public_stream) = state.pending.lock().await.remove(&conn_id) else {
+    let Some((mut public_stream, peer)) = state.pending.lock().await.remove(&conn_id) else {
         warn!(conn_id, "data connection for unknown or expired conn_id");
         return Ok(());
     };
 
     let started = Instant::now();
     let result = copy_bidirectional(&mut stream, &mut public_stream).await;
-    log_close("reverse", public_stream.peer_addr().unwrap_or_else(|_| "?:0".parse().unwrap()), started, result);
+    log_close("reverse", peer, started, result);
     Ok(())
 }
 
