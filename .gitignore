@@ -1,5 +1,8 @@
 /.vscode
 /target
 config.toml
+server.toml
+client.toml
+*.pem
 /tests
 /USAGE.md

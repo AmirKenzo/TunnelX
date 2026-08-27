@@ -1,0 +1,20 @@
+# tunnelx relay server — runs on the foreign box. See tests/forward-tunnel.md
+# and tests/reverse-tunnel.md for full walkthroughs.
+
+mode = "server"
+log_level = "info"
+listen = "0.0.0.0:9000"
+transport = "wss"          # tcp | tls | ws | wss
+token = "change-me-to-a-long-random-string"
+tls_cert = "cert.pem"      # only needed for transport = tls or wss (see tests/gencert.md)
+tls_key = "key.pem"
+
+[[tunnel]]
+name = "ssh-out"
+direction = "forward"
+allowed_targets = ["1.2.3.4:22"]   # optional allowlist; empty/omitted = allow any target
+
+[[tunnel]]
+name = "web"
+direction = "reverse"
+remote_listen = "0.0.0.0:8080"

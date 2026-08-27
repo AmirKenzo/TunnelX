@@ -9,7 +9,7 @@ use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
 use crate::config::{Config, ForwardRule};
-use crate::forward::{self, Registry};
+use crate::direct::forward::{self, Registry};
 use crate::logging;
 
 const RELOAD_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -23,7 +23,7 @@ struct ActiveRule {
 /// `listen` address didn't change keeps its listener socket bound (no dropped
 /// connections mid-reload); only `target` is updated live. A changed `listen`
 /// (or a removed/added rule) rebinds just that one listener.
-pub async fn run(config_path: PathBuf, initial: Config, log_handle: logging::Handle) {
+pub async fn run(config_path: PathBuf, initial: crate::config::DirectConfig, log_handle: logging::Handle) {
     let mut current_log_level = initial.log_level.clone();
     let registry: Registry = Arc::new(RwLock::new(initial.by_name()));
     let mut active: HashMap<String, ActiveRule> = HashMap::new();
@@ -44,7 +44,11 @@ pub async fn run(config_path: PathBuf, initial: Config, log_handle: logging::Han
         last_modified = modified;
 
         let new_config = match Config::load(&config_path) {
-            Ok(c) => c,
+            Ok(Config::Direct(c)) => c,
+            Ok(_) => {
+                error!("config reload failed: 'mode' changed away from direct, keeping previous config running (restart the process to switch modes)");
+                continue;
+            }
             Err(e) => {
                 error!(error = %e, "config reload failed, keeping previous config");
                 continue;
@@ -65,7 +69,7 @@ pub async fn run(config_path: PathBuf, initial: Config, log_handle: logging::Han
     }
 }
 
-async fn reload(active: &mut HashMap<String, ActiveRule>, registry: &Registry, new: Config) {
+async fn reload(active: &mut HashMap<String, ActiveRule>, registry: &Registry, new: crate::config::DirectConfig) {
     let new_rules = new.by_name();
 
     // Snapshot the old state, then apply the diff without holding the lock

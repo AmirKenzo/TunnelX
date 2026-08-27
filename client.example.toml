@@ -1,0 +1,21 @@
+# tunnelx relay client — runs on the Iran box. See tests/forward-tunnel.md
+# and tests/reverse-tunnel.md for full walkthroughs.
+
+mode = "client"
+log_level = "info"
+server = "SERVER_PUBLIC_IP:9000"
+transport = "wss"          # must match the server's transport
+token = "change-me-to-a-long-random-string"   # must match the server's token
+tls_ca_cert = "cert.pem"   # the server's cert.pem, copied over (see tests/gencert.md)
+# tls_insecure = true      # alternative to tls_ca_cert: skip verification entirely
+
+[[tunnel]]
+name = "ssh-out"
+direction = "forward"
+local_listen = "127.0.0.1:2222"
+remote_target = "1.2.3.4:22"
+
+[[tunnel]]
+name = "web"
+direction = "reverse"
+local_target = "127.0.0.1:80"
