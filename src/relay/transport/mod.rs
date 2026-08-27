@@ -4,7 +4,7 @@ mod ws;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use rustls::pki_types::ServerName;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -111,14 +111,4 @@ async fn dial_tls(
     let server_name = ServerName::try_from(host.to_string())
         .with_context(|| format!("invalid server name '{host}' for TLS"))?;
     Ok(connector.connect(server_name, tcp).await?)
-}
-
-pub fn parse_kind(s: &str) -> Result<Kind> {
-    match s.to_lowercase().as_str() {
-        "tcp" => Ok(Kind::Tcp),
-        "tls" => Ok(Kind::Tls),
-        "ws" => Ok(Kind::Ws),
-        "wss" => Ok(Kind::Wss),
-        other => bail!("unknown transport '{other}' (expected one of: tcp, tls, ws, wss)"),
-    }
 }
