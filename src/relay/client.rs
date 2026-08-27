@@ -1,9 +1,10 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
+use tokio::time::interval;
 use tracing::{error, info, warn};
 
 use crate::config::{ClientConfig, ClientTunnel};
@@ -44,6 +45,13 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         let _ = t.await;
     }
     Ok(())
+}
+
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn now_millis() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 async fn authenticate<S>(stream: &mut S, token: &str) -> Result<()>
@@ -158,29 +166,55 @@ async fn run_reverse_once(config: &ClientConfig, tls: &TlsClientOpts, name: &str
         other => bail!("unexpected response to register: {other:?}"),
     }
 
-    info!(name = %name, server = %config.server, local_target = %local_target, "reverse tunnel registered, waiting for connections");
+    // Verify the control connection actually round-trips before declaring it up,
+    // rather than just trusting that RegisterOk means the link is healthy.
+    let verify_ts = now_millis();
+    write_msg(&mut stream, &Message::Ping { ts_millis: verify_ts }).await?;
+    match tokio::time::timeout(PING_TIMEOUT, read_msg(&mut stream)).await {
+        Ok(Ok(Message::Pong { ts_millis })) => {
+            info!(
+                name = %name, server = %config.server, local_target = %local_target,
+                rtt_ms = now_millis().saturating_sub(ts_millis),
+                "reverse tunnel connected and verified, waiting for connections"
+            );
+        }
+        Ok(Ok(other)) => bail!("expected pong to verify connection, got {other:?}"),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => bail!("no response to initial ping, connection appears unhealthy"),
+    }
+
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let mut keepalive = interval(KEEPALIVE_INTERVAL);
+    keepalive.tick().await; // first tick fires immediately, skip it
 
     loop {
-        match read_msg(&mut stream).await? {
-            Message::NewConnection { conn_id } => {
-                let name = name.to_string();
-                let local_target = local_target.to_string();
-                let server_addr = config.server.clone();
-                let transport_kind = config.transport;
-                let token = config.token.clone();
-                let tls = tls.clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_new_connection(conn_id, &server_addr, transport_kind, &tls, &token, &local_target).await
-                    {
-                        warn!(name = %name, conn_id, error = %e, "reverse data connection failed");
+        tokio::select! {
+            msg = read_msg(&mut read_half) => {
+                match msg? {
+                    Message::NewConnection { conn_id } => {
+                        let name = name.to_string();
+                        let local_target = local_target.to_string();
+                        let server_addr = config.server.clone();
+                        let transport_kind = config.transport;
+                        let token = config.token.clone();
+                        let tls = tls.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                handle_new_connection(conn_id, &server_addr, transport_kind, &tls, &token, &local_target).await
+                            {
+                                warn!(name = %name, conn_id, error = %e, "reverse data connection failed");
+                            }
+                        });
                     }
-                });
+                    Message::Pong { ts_millis } => {
+                        tracing::debug!(name = %name, rtt_ms = now_millis().saturating_sub(ts_millis), "keepalive pong received");
+                    }
+                    other => warn!(name = %name, message = ?other, "unexpected message on reverse control connection"),
+                }
             }
-            Message::Ping { ts_millis } => {
-                write_msg(&mut stream, &Message::Pong { ts_millis }).await?;
+            _ = keepalive.tick() => {
+                write_msg(&mut write_half, &Message::Ping { ts_millis: now_millis() }).await?;
             }
-            other => warn!(name = %name, message = ?other, "unexpected message on reverse control connection"),
         }
     }
 }
