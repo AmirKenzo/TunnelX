@@ -9,8 +9,11 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::config::ForwardRule;
+use crate::util::LogThrottle;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const ACCEPT_ERROR_LOG_WINDOW: Duration = Duration::from_secs(5);
+const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub type Registry = Arc<RwLock<HashMap<String, ForwardRule>>>;
 
@@ -24,11 +27,15 @@ pub async fn run(name: String, listen: String, registry: Registry) -> Result<()>
 
     info!(name = %name, listen = %listen, "listening");
 
+    let mut accept_error_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
     loop {
         let (inbound, peer_addr) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
-                error!(name = %name, error = %e, "accept failed");
+                if let Some(suppressed) = accept_error_throttle.allow() {
+                    error!(name = %name, error = %e, suppressed, "accept failed");
+                }
+                tokio::time::sleep(ACCEPT_ERROR_RETRY_DELAY).await;
                 continue;
             }
         };

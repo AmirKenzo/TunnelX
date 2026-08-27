@@ -2,6 +2,7 @@ mod config;
 mod direct;
 mod logging;
 mod relay;
+mod util;
 
 use std::path::PathBuf;
 

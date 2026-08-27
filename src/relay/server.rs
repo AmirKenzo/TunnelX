@@ -12,8 +12,11 @@ use tracing::{error, info, warn};
 use crate::config::{ServerConfig, ServerTunnel};
 use crate::relay::protocol::{read_msg, write_msg, Message};
 use crate::relay::transport::{self, BoxedStream, TlsServerOpts};
+use crate::util::LogThrottle;
 
 const PENDING_CONN_TIMEOUT: Duration = Duration::from_secs(10);
+const ACCEPT_ERROR_LOG_WINDOW: Duration = Duration::from_secs(5);
+const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 struct State {
     config: ServerConfig,
@@ -59,11 +62,15 @@ pub async fn run(config: ServerConfig) -> Result<()> {
 
     info!(listen = %listen_addr, transport = ?transport_kind, "relay server listening");
 
+    let mut accept_error_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
-                error!(error = %e, "accept failed");
+                if let Some(suppressed) = accept_error_throttle.allow() {
+                    error!(error = %e, suppressed, "accept failed");
+                }
+                tokio::time::sleep(ACCEPT_ERROR_RETRY_DELAY).await;
                 continue;
             }
         };
@@ -87,11 +94,15 @@ fn spawn_public_listener(state: Arc<State>, name: String, remote_listen: String)
         };
         info!(name = %name, listen = %remote_listen, "reverse tunnel public listener up");
 
+        let mut accept_error_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(p) => p,
                 Err(e) => {
-                    error!(name = %name, error = %e, "accept failed on public listener");
+                    if let Some(suppressed) = accept_error_throttle.allow() {
+                        error!(name = %name, error = %e, suppressed, "accept failed on public listener");
+                    }
+                    tokio::time::sleep(ACCEPT_ERROR_RETRY_DELAY).await;
                     continue;
                 }
             };

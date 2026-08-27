@@ -10,6 +10,10 @@ use tracing::{error, info, warn};
 use crate::config::{ClientConfig, ClientTunnel};
 use crate::relay::protocol::{read_msg, write_msg, Message};
 use crate::relay::transport::{self, TlsClientOpts};
+use crate::util::LogThrottle;
+
+const ACCEPT_ERROR_LOG_WINDOW: Duration = Duration::from_secs(5);
+const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 const RECONNECT_BACKOFF: [Duration; 5] = [
     Duration::from_millis(500),
@@ -83,11 +87,15 @@ async fn run_forward(
 
     info!(name = %name, listen = %local_listen, server = %config.server, remote_target = %remote_target, "forward tunnel listening");
 
+    let mut accept_error_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
     loop {
         let (inbound, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
-                error!(name = %name, error = %e, "accept failed");
+                if let Some(suppressed) = accept_error_throttle.allow() {
+                    error!(name = %name, error = %e, suppressed, "accept failed");
+                }
+                tokio::time::sleep(ACCEPT_ERROR_RETRY_DELAY).await;
                 continue;
             }
         };

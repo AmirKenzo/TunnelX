@@ -8,7 +8,7 @@ use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
@@ -53,12 +53,13 @@ pub fn build_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> 
 pub fn build_connector(ca_cert_path: Option<&Path>, insecure: bool) -> Result<TlsConnector> {
     ensure_crypto_provider();
     let config = if let Some(path) = ca_cert_path {
-        let mut roots = RootCertStore::empty();
-        for cert in load_certs(path)? {
-            roots.add(cert).context("failed to add pinned certificate to trust store")?;
-        }
+        let pinned = load_certs(path)?
+            .into_iter()
+            .next()
+            .context("no certificate found in tls_ca_cert file")?;
         ClientConfig::builder()
-            .with_root_certificates(roots)
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier::new(pinned)))
             .with_no_client_auth()
     } else if insecure {
         ClientConfig::builder()
@@ -86,6 +87,69 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut data.as_slice())
         .with_context(|| format!("failed to parse private key in {}", path.display()))?
         .with_context(|| format!("no private key found in {}", path.display()))
+}
+
+/// Verifies the server's certificate is byte-for-byte the one pinned via
+/// `tls_ca_cert`, instead of doing hostname/SAN validation against a CA chain.
+/// This is the correct model for a pinned self-signed cert: we don't care what
+/// hostname/IP is embedded in it (the server is usually dialed by bare IP,
+/// which the cert has no SAN for), only that it's the exact cert we expect.
+/// Signature verification still runs normally so a stolen public cert alone
+/// can't be replayed without the matching private key.
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    pinned: CertificateDer<'static>,
+    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl PinnedCertVerifier {
+    fn new(pinned: CertificateDer<'static>) -> Self {
+        Self {
+            pinned,
+            supported_algs: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.pinned.as_ref() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "server certificate does not match the pinned tls_ca_cert".to_string(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_algs.supported_schemes()
+    }
 }
 
 #[derive(Debug)]
