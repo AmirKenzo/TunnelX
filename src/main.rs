@@ -49,40 +49,37 @@ async fn main() -> Result<()> {
     let config = Config::load(&args.config)?;
     let log_handle = logging::init(config.log_level())?;
 
-    info!(version = env!("CARGO_PKG_VERSION"), "tunnelx starting");
+    // Printed directly to stderr, bypassing the log_level filter entirely: this
+    // is the one thing you always want to see regardless of verbosity setting.
+    match &config {
+        Config::Direct(c) => eprintln!(
+            "tunnelx v{} starting — mode=direct rules={} config={} log_level={}",
+            env!("CARGO_PKG_VERSION"), c.forwards.len(), args.config.display(), c.log_level
+        ),
+        Config::Client(c) => eprintln!(
+            "tunnelx v{} starting — mode=client server={} transport={:?} tunnels={} log_level={}",
+            env!("CARGO_PKG_VERSION"), c.server, c.transport, c.tunnels.len(), c.log_level
+        ),
+        Config::Server(c) => eprintln!(
+            "tunnelx v{} starting — mode=server listen={} transport={:?} tunnels={} log_level={}",
+            env!("CARGO_PKG_VERSION"), c.listen, c.transport, c.tunnels.len(), c.log_level
+        ),
+    }
 
     match config {
         Config::Direct(direct_config) => {
-            info!(
-                rules = direct_config.forwards.len(),
-                config = %args.config.display(),
-                log_level = %direct_config.log_level,
-                "starting tunnelx (direct mode, config auto-reloads on change)"
-            );
             tokio::select! {
                 _ = direct::supervisor::run(args.config, direct_config, log_handle) => {}
                 _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),
             }
         }
         Config::Client(client_config) => {
-            info!(
-                server = %client_config.server,
-                transport = ?client_config.transport,
-                tunnels = client_config.tunnels.len(),
-                "starting tunnelx (client mode)"
-            );
             tokio::select! {
                 r = relay::client::run(client_config) => { r?; }
                 _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),
             }
         }
         Config::Server(server_config) => {
-            info!(
-                listen = %server_config.listen,
-                transport = ?server_config.transport,
-                tunnels = server_config.tunnels.len(),
-                "starting tunnelx (server mode)"
-            );
             tokio::select! {
                 r = relay::server::run(server_config) => { r?; }
                 _ = tokio::signal::ctrl_c() => info!("shutdown signal received"),
