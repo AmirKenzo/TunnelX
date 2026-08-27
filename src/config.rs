@@ -10,10 +10,6 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_mode() -> String {
-    "direct".to_string()
-}
-
 /// Top-level config. `mode` decides which of the three shapes below applies;
 /// it's optional and defaults to "direct" so existing direct-mode config
 /// files (no `mode` key) keep working unchanged.
