@@ -1,0 +1,16 @@
+# tunnelx config — list of TCP forwarding rules.
+# Each rule opens `listen` locally and forwards every connection to `target`.
+
+# Log verbosity: off, error, warn, info, debug, trace. Optional, defaults to "info".
+# Changing this and saving the file applies it live, no restart needed.
+log_level = "info"
+
+[[forward]]
+name = "ssh"
+listen = "0.0.0.0:2222"
+target = "1.2.3.4:22"
+
+[[forward]]
+name = "web"
+listen = "0.0.0.0:8080"
+target = "5.6.7.8:80"
