@@ -30,6 +30,10 @@ pub fn set_level(handle: &Handle, level: &str) -> Result<()> {
     }
     let filter = build_filter(level)?;
     handle.reload(filter).context("failed to apply new log level")?;
+    // tracing caches each log callsite's enabled/disabled "interest" the first time
+    // it fires; without this, callsites already marked enabled under the old filter
+    // stay enabled forever regardless of what the new filter says.
+    tracing::callsite::rebuild_interest_cache();
     Ok(())
 }
 
