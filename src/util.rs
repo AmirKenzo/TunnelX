@@ -1,5 +1,21 @@
 use std::time::{Duration, Instant};
 
+/// Compares two secrets without short-circuiting on the first differing byte,
+/// so response time doesn't leak how many leading bytes of a guess were
+/// correct (a network attacker who can measure timing precisely enough could
+/// otherwise brute-force the auth token one byte at a time against `==`).
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Collapses a burst of identical/frequent errors (e.g. a tight accept-error
 /// loop, or a flood of bad handshakes) into one log line per time window
 /// instead of one line per occurrence.

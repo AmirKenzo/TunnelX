@@ -1,10 +1,15 @@
-//! Wire format for the relay client<->server control/data connections.
+//! Wire format for the relay client<->server connections.
 //!
-//! Every message is a `u32` little-endian length prefix followed by that many
-//! bytes of bincode-encoded `Message`. Kept deliberately flat (no multiplexing
-//! layer): a forward tunnel opens one physical connection per proxied
-//! connection; a reverse tunnel keeps one long-lived control connection per
-//! tunnel plus one short-lived data connection per proxied connection.
+//! Every physical connection starts with a fixed 8-byte version handshake
+//! (`write_handshake`/`read_and_check_handshake`, checked before anything
+//! else), then a `u32` little-endian length prefix + bincode-encoded
+//! `Message` for `Auth`/`Register`. From there on the connection is handed to
+//! `relay::mux::MuxSession`: a small pool of these physical connections per
+//! tunnel carries many multiplexed logical streams, so opening a new proxied
+//! connection is "open a mux stream" rather than "open a new physical
+//! connection." `ForwardConn` is the first length-prefixed message on a
+//! forward tunnel's data stream; `Ping`/`Pong` are the only messages ever
+//! seen on a session's dedicated control stream.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,31 +17,66 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 
+/// Arbitrary 4 bytes identifying a tunnelx handshake (spells "TNLX" in ASCII
+/// when read as bytes), so a stray non-tunnelx peer or a wildly incompatible
+/// old binary fails immediately with a clear error instead of a confusing
+/// bincode decode failure somewhere downstream.
+const PROTOCOL_MAGIC: u32 = 0x544e_4c58;
+/// Bumped whenever the wire format changes in an incompatible way. Bumped to
+/// 2 for the yamux multiplexing rewrite (removed `NewConnection`/`DataConn`,
+/// renamed `RegisterReverse` to `Register`).
+const PROTOCOL_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
-    /// First message on every connection (control or data).
+    /// First length-prefixed message on every physical connection (after the
+    /// version handshake).
     Auth { token: String },
     AuthOk,
     AuthFail { reason: String },
 
-    /// Sent by the client to open a persistent control connection for a reverse tunnel.
-    RegisterReverse { name: String },
+    /// Sent by the client to register a physical connection into a tunnel's
+    /// session pool — used by both forward and reverse tunnels.
+    Register { name: String },
     RegisterOk,
     RegisterFail { reason: String },
 
-    /// Server -> client on a reverse tunnel's control connection: a public
-    /// connection arrived, please open a data connection for it.
-    NewConnection { conn_id: u64 },
-    /// Client -> server on a brand new connection: this is the data connection
-    /// for `conn_id` requested above.
-    DataConn { conn_id: u64 },
-
-    /// Client -> server on a brand new connection: proxy this connection to
+    /// First message on a forward tunnel's data stream: proxy this stream to
     /// `target`, provided the server's config allows it for forward tunnel `name`.
     ForwardConn { name: String, target: String },
 
     Ping { ts_millis: u64 },
     Pong { ts_millis: u64 },
+}
+
+/// Written by both sides at the start of every new physical connection,
+/// before `Auth`. Not bincode-framed like `Message` deliberately: it must be
+/// decodable even by a peer running a wire-incompatible version.
+pub async fn write_handshake<W: AsyncWrite + Unpin>(w: &mut W) -> Result<()> {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&PROTOCOL_MAGIC.to_le_bytes());
+    buf[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    w.write_all(&buf).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+pub async fn read_and_check_handshake<R: AsyncRead + Unpin>(r: &mut R) -> Result<()> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf).await.context(
+        "failed to read protocol handshake (peer closed early, wrong port, or an incompatible tunnelx binary)",
+    )?;
+    let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    if magic != PROTOCOL_MAGIC {
+        bail!("not a tunnelx peer (bad protocol magic 0x{magic:08x})");
+    }
+    if version != PROTOCOL_VERSION {
+        bail!(
+            "protocol version mismatch: local={PROTOCOL_VERSION}, peer={version} — rebuild and restart both client and server together"
+        );
+    }
+    Ok(())
 }
 
 pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Result<()> {

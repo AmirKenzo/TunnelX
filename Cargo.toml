@@ -23,6 +23,9 @@ rustls-pemfile = "2"
 rcgen = "0.13"
 tokio-tungstenite = "0.24"
 bytes = "1"
+rand = "0.8"
+yamux = "0.14"
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [profile.release]
 lto = true

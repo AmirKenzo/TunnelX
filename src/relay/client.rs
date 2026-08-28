@@ -1,14 +1,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use rand::Rng;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpListener;
-use tokio::time::interval;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::config::{ClientConfig, ClientTunnel};
-use crate::relay::protocol::{read_msg, write_msg, Message};
+use crate::relay::mux::{MuxSession, MuxStream};
+use crate::relay::protocol::{self, read_msg, write_msg, Message};
 use crate::relay::transport::{self, TlsClientOpts};
 use crate::util::LogThrottle;
 
@@ -34,12 +36,12 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         tasks.push(tokio::spawn(async move {
             match tunnel {
                 ClientTunnel::Forward { name, local_listen, remote_target } => {
-                    if let Err(e) = run_forward(&config, &tls_opts, &name, &local_listen, &remote_target).await {
+                    if let Err(e) = run_forward(config, tls_opts, name.clone(), local_listen, remote_target).await {
                         error!(name = %name, error = %e, "forward tunnel stopped");
                     }
                 }
                 ClientTunnel::Reverse { name, local_target } => {
-                    run_reverse_with_backoff(&config, &tls_opts, name, local_target).await;
+                    run_reverse_with_backoff(config, tls_opts, name, local_target).await;
                 }
             }
         }));
@@ -52,12 +54,21 @@ pub async fn run(config: ClientConfig) -> Result<()> {
 }
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+/// Jitter applied to each keepalive delay (+/-), so pings don't go out on an
+/// exact, perfectly periodic 20.000s cadence that's trivial to fingerprint
+/// from traffic timing alone.
+const KEEPALIVE_JITTER: Duration = Duration::from_secs(4);
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
-/// If no pong has been seen for this long, the control connection is treated
-/// as dead even though reads/writes on the socket itself haven't errored
-/// (e.g. traffic silently black-holed instead of RST/FIN'd) so we reconnect
-/// instead of waiting indefinitely for a link that will never come back.
+/// If no pong has been seen for this long, the session's control stream is
+/// treated as dead even though reads/writes on it haven't errored (e.g.
+/// traffic silently black-holed instead of RST/FIN'd) so we reconnect instead
+/// of waiting indefinitely for a link that will never come back.
 const PONG_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn next_keepalive_delay() -> Duration {
+    let jitter_ms = rand::thread_rng().gen_range(0..=KEEPALIVE_JITTER.as_millis() as u64 * 2);
+    (KEEPALIVE_INTERVAL - KEEPALIVE_JITTER) + Duration::from_millis(jitter_ms)
+}
 
 fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -76,21 +87,109 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// forward tunnels: listen locally, dial the server once per connection.
+// shared: a pool of multiplexed physical sessions per tunnel. Opening a new
+// proxied connection means picking a live session and opening a stream on it
+// instead of dialing a brand new physical connection.
+// ---------------------------------------------------------------------------
+
+type SessionPool = Arc<Mutex<Vec<Arc<MuxSession>>>>;
+
+async fn pick_session(pool: &SessionPool) -> Option<Arc<MuxSession>> {
+    let mut sessions = pool.lock().await;
+    sessions.retain(|s| !s.is_closed());
+    if sessions.is_empty() {
+        return None;
+    }
+    let idx = rand::thread_rng().gen_range(0..sessions.len());
+    Some(sessions[idx].clone())
+}
+
+/// Dials, version-checks, authenticates, and registers one physical
+/// connection, then wraps it as a multiplexed session. Used to establish
+/// every pooled session for both forward and reverse tunnels.
+async fn establish_pooled_session(config: &ClientConfig, tls: &TlsClientOpts, name: &str) -> Result<MuxSession> {
+    let mut stream = transport::dial(config.transport, &config.server, tls)
+        .await
+        .context("failed to connect to server")?;
+    protocol::write_handshake(&mut stream).await?;
+    protocol::read_and_check_handshake(&mut stream).await?;
+    authenticate(&mut stream, &config.token).await?;
+
+    write_msg(&mut stream, &Message::Register { name: name.to_string() }).await?;
+    match read_msg(&mut stream).await? {
+        Message::RegisterOk => {}
+        Message::RegisterFail { reason } => bail!("server rejected registration: {reason}"),
+        other => bail!("unexpected response to register: {other:?}"),
+    }
+
+    Ok(MuxSession::new(stream, yamux::Mode::Client))
+}
+
+/// Opens this session's one dedicated control stream, verifies it round-trips,
+/// then keeps pinging it on a jittered interval for the life of the session —
+/// the same liveness contract every pooled session (forward or reverse) needs.
+async fn run_ping_stream(session: &MuxSession, name: &str) -> Result<()> {
+    let ping_stream = session.open_stream().await.context("failed to open control/ping stream")?;
+    let (mut read_half, mut write_half) = tokio::io::split(ping_stream);
+
+    // Verify the control stream actually round-trips before declaring the
+    // session up, rather than just trusting that RegisterOk means it's healthy.
+    let verify_ts = now_millis();
+    write_msg(&mut write_half, &Message::Ping { ts_millis: verify_ts }).await?;
+    match tokio::time::timeout(PING_TIMEOUT, read_msg(&mut read_half)).await {
+        Ok(Ok(Message::Pong { ts_millis })) => {
+            info!(name = %name, rtt_ms = now_millis().saturating_sub(ts_millis), "pooled session control stream verified");
+        }
+        Ok(Ok(other)) => bail!("expected pong to verify control stream, got {other:?}"),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => bail!("no response to initial ping, control stream appears unhealthy"),
+    }
+
+    let mut last_pong = Instant::now();
+    loop {
+        let keepalive = tokio::time::sleep(next_keepalive_delay());
+        tokio::select! {
+            msg = read_msg(&mut read_half) => {
+                match msg? {
+                    Message::Pong { ts_millis } => {
+                        last_pong = Instant::now();
+                        tracing::debug!(name = %name, rtt_ms = now_millis().saturating_sub(ts_millis), "keepalive pong received");
+                    }
+                    other => warn!(name = %name, message = ?other, "unexpected message on control stream"),
+                }
+            }
+            _ = keepalive => {
+                if last_pong.elapsed() > PONG_TIMEOUT {
+                    bail!("no pong received in over {:?}, session appears dead", PONG_TIMEOUT);
+                }
+                write_msg(&mut write_half, &Message::Ping { ts_millis: now_millis() }).await?;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// forward tunnels: listen locally, keep a pool of pre-authenticated sessions
+// to the server, open a mux stream on one per accepted local connection.
 // ---------------------------------------------------------------------------
 
 async fn run_forward(
-    config: &ClientConfig,
-    tls: &TlsClientOpts,
-    name: &str,
-    local_listen: &str,
-    remote_target: &str,
+    config: Arc<ClientConfig>,
+    tls: Arc<TlsClientOpts>,
+    name: String,
+    local_listen: String,
+    remote_target: String,
 ) -> Result<()> {
-    let listener = TcpListener::bind(local_listen)
+    let listener = TcpListener::bind(&local_listen)
         .await
         .with_context(|| format!("tunnel '{name}': failed to bind {local_listen}"))?;
 
     info!(name = %name, listen = %local_listen, server = %config.server, remote_target = %remote_target, "forward tunnel listening");
+
+    let pool: SessionPool = Arc::new(Mutex::new(Vec::new()));
+    for _ in 0..config.mux_connections {
+        tokio::spawn(run_forward_session_with_backoff(config.clone(), tls.clone(), name.clone(), pool.clone()));
+    }
 
     let mut accept_error_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
     loop {
@@ -106,17 +205,13 @@ async fn run_forward(
         };
         inbound.set_nodelay(true).ok();
 
-        let name = name.to_string();
-        let remote_target = remote_target.to_string();
-        let server_addr = config.server.clone();
-        let transport_kind = config.transport;
-        let token = config.token.clone();
-        let tls = tls.clone();
+        let pool = pool.clone();
+        let name = name.clone();
+        let remote_target = remote_target.clone();
 
         tokio::spawn(async move {
             let started = Instant::now();
-            match handle_forward_conn(inbound, &server_addr, transport_kind, &tls, &token, &name, &remote_target).await
-            {
+            match handle_forward_conn(inbound, &pool, &name, &remote_target).await {
                 Ok((tx, rx)) => info!(
                     name = %name, peer = %peer, sent = tx, received = rx,
                     duration_ms = started.elapsed().as_millis(), "forward connection closed"
@@ -129,136 +224,127 @@ async fn run_forward(
 
 async fn handle_forward_conn(
     mut inbound: tokio::net::TcpStream,
-    server_addr: &str,
-    transport_kind: transport::Kind,
-    tls: &TlsClientOpts,
-    token: &str,
+    pool: &SessionPool,
     name: &str,
     remote_target: &str,
 ) -> Result<(u64, u64)> {
-    let mut stream = transport::dial(transport_kind, server_addr, tls)
-        .await
-        .context("failed to connect to server")?;
-    authenticate(&mut stream, token).await?;
+    let session = pick_session(pool).await.context("no healthy pooled session available for this tunnel")?;
+    let mut stream = session.open_stream().await.context("failed to open mux stream")?;
     write_msg(&mut stream, &Message::ForwardConn { name: name.to_string(), target: remote_target.to_string() }).await?;
 
     let (tx, rx) = copy_bidirectional(&mut inbound, &mut stream).await?;
     Ok((tx, rx))
 }
 
-// ---------------------------------------------------------------------------
-// reverse tunnels: keep one persistent control connection registered with the
-// server; on each `NewConnection` push, open a fresh data connection back.
-// ---------------------------------------------------------------------------
-
-async fn run_reverse_with_backoff(config: &ClientConfig, tls: &TlsClientOpts, name: String, local_target: String) {
+async fn run_forward_session_with_backoff(config: Arc<ClientConfig>, tls: Arc<TlsClientOpts>, name: String, pool: SessionPool) {
     let mut attempt = 0usize;
     loop {
-        match run_reverse_once(config, tls, &name, &local_target).await {
-            Ok(()) => attempt = 0, // clean shutdown (shouldn't normally happen), reset backoff
-            Err(e) => warn!(name = %name, error = %e, "reverse tunnel control connection lost"),
+        let result = run_forward_session_once(&config, &tls, &name, &pool).await;
+        match result {
+            Ok(()) => attempt = 0,
+            Err(e) => warn!(name = %name, error = %e, "pooled forward session lost"),
         }
 
         let delay = RECONNECT_BACKOFF[attempt.min(RECONNECT_BACKOFF.len() - 1)];
         attempt += 1;
-        info!(name = %name, delay_ms = delay.as_millis(), "reconnecting reverse tunnel");
+        info!(name = %name, delay_ms = delay.as_millis(), "reconnecting pooled forward session");
         tokio::time::sleep(delay).await;
     }
 }
 
-async fn run_reverse_once(config: &ClientConfig, tls: &TlsClientOpts, name: &str, local_target: &str) -> Result<()> {
-    let mut stream = transport::dial(config.transport, &config.server, tls)
-        .await
-        .context("failed to connect to server")?;
-    authenticate(&mut stream, &config.token).await?;
+async fn run_forward_session_once(config: &ClientConfig, tls: &TlsClientOpts, name: &str, pool: &SessionPool) -> Result<()> {
+    let session = Arc::new(establish_pooled_session(config, tls, name).await?);
+    pool.lock().await.push(session.clone());
+    let result = run_ping_stream(&session, name).await;
+    pool.lock().await.retain(|s| !Arc::ptr_eq(s, &session));
+    result
+}
 
-    write_msg(&mut stream, &Message::RegisterReverse { name: name.to_string() }).await?;
-    match read_msg(&mut stream).await? {
-        Message::RegisterOk => {}
-        Message::RegisterFail { reason } => bail!("server rejected reverse tunnel registration: {reason}"),
-        other => bail!("unexpected response to register: {other:?}"),
+// ---------------------------------------------------------------------------
+// reverse tunnels: keep a pool of pre-authenticated, pre-registered sessions;
+// on each stream the server opens against one, proxy it to local_target.
+// ---------------------------------------------------------------------------
+
+async fn run_reverse_with_backoff(config: Arc<ClientConfig>, tls: Arc<TlsClientOpts>, name: String, local_target: String) {
+    let pool: SessionPool = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+    for _ in 0..config.mux_connections {
+        handles.push(tokio::spawn(run_reverse_session_with_backoff(
+            config.clone(),
+            tls.clone(),
+            name.clone(),
+            local_target.clone(),
+            pool.clone(),
+        )));
     }
-
-    // Verify the control connection actually round-trips before declaring it up,
-    // rather than just trusting that RegisterOk means the link is healthy.
-    let verify_ts = now_millis();
-    write_msg(&mut stream, &Message::Ping { ts_millis: verify_ts }).await?;
-    match tokio::time::timeout(PING_TIMEOUT, read_msg(&mut stream)).await {
-        Ok(Ok(Message::Pong { ts_millis })) => {
-            info!(
-                name = %name, server = %config.server, local_target = %local_target,
-                rtt_ms = now_millis().saturating_sub(ts_millis),
-                "reverse tunnel connected and verified, waiting for connections"
-            );
-        }
-        Ok(Ok(other)) => bail!("expected pong to verify connection, got {other:?}"),
-        Ok(Err(e)) => return Err(e),
-        Err(_) => bail!("no response to initial ping, connection appears unhealthy"),
-    }
-
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
-    let mut keepalive = interval(KEEPALIVE_INTERVAL);
-    keepalive.tick().await; // first tick fires immediately, skip it
-    let mut last_pong = Instant::now();
-
-    loop {
-        tokio::select! {
-            msg = read_msg(&mut read_half) => {
-                match msg? {
-                    Message::NewConnection { conn_id } => {
-                        let name = name.to_string();
-                        let local_target = local_target.to_string();
-                        let server_addr = config.server.clone();
-                        let transport_kind = config.transport;
-                        let token = config.token.clone();
-                        let tls = tls.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_new_connection(conn_id, &server_addr, transport_kind, &tls, &token, &local_target).await
-                            {
-                                warn!(name = %name, conn_id, error = %e, "reverse data connection failed");
-                            }
-                        });
-                    }
-                    Message::Pong { ts_millis } => {
-                        last_pong = Instant::now();
-                        tracing::debug!(name = %name, rtt_ms = now_millis().saturating_sub(ts_millis), "keepalive pong received");
-                    }
-                    other => warn!(name = %name, message = ?other, "unexpected message on reverse control connection"),
-                }
-            }
-            _ = keepalive.tick() => {
-                if last_pong.elapsed() > PONG_TIMEOUT {
-                    bail!(
-                        "no pong received in over {:?}, control connection appears dead",
-                        PONG_TIMEOUT
-                    );
-                }
-                write_msg(&mut write_half, &Message::Ping { ts_millis: now_millis() }).await?;
-            }
-        }
+    for h in handles {
+        let _ = h.await;
     }
 }
 
-async fn handle_new_connection(
-    conn_id: u64,
-    server_addr: &str,
-    transport_kind: transport::Kind,
-    tls: &TlsClientOpts,
-    token: &str,
-    local_target: &str,
-) -> Result<()> {
-    let mut data_stream = transport::dial(transport_kind, server_addr, tls)
-        .await
-        .context("failed to open data connection")?;
-    authenticate(&mut data_stream, token).await?;
-    write_msg(&mut data_stream, &Message::DataConn { conn_id }).await?;
+async fn run_reverse_session_with_backoff(
+    config: Arc<ClientConfig>,
+    tls: Arc<TlsClientOpts>,
+    name: String,
+    local_target: String,
+    pool: SessionPool,
+) {
+    let mut attempt = 0usize;
+    loop {
+        match run_reverse_session_once(&config, &tls, &name, &local_target, &pool).await {
+            Ok(()) => attempt = 0,
+            Err(e) => warn!(name = %name, error = %e, "pooled reverse session lost"),
+        }
 
+        let delay = RECONNECT_BACKOFF[attempt.min(RECONNECT_BACKOFF.len() - 1)];
+        attempt += 1;
+        info!(name = %name, delay_ms = delay.as_millis(), "reconnecting pooled reverse session");
+        tokio::time::sleep(delay).await;
+    }
+}
+
+async fn run_reverse_session_once(
+    config: &ClientConfig,
+    tls: &TlsClientOpts,
+    name: &str,
+    local_target: &str,
+    pool: &SessionPool,
+) -> Result<()> {
+    let session = Arc::new(establish_pooled_session(config, tls, name).await?);
+    pool.lock().await.push(session.clone());
+    info!(
+        name = %name, server = %config.server, local_target = %local_target,
+        "pooled reverse session registered, waiting for connections"
+    );
+
+    let result = tokio::select! {
+        r = run_ping_stream(&session, name) => r,
+        r = accept_reverse_connections(&session, name, local_target) => r,
+    };
+
+    pool.lock().await.retain(|s| !Arc::ptr_eq(s, &session));
+    result
+}
+
+async fn accept_reverse_connections(session: &MuxSession, name: &str, local_target: &str) -> Result<()> {
+    loop {
+        let mux_stream = session.accept_stream().await.ok_or_else(|| anyhow!("mux session closed"))?;
+        let name = name.to_string();
+        let local_target = local_target.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = handle_reverse_data_stream(mux_stream, &local_target).await {
+                warn!(name = %name, error = %e, "reverse data stream failed");
+            }
+        });
+    }
+}
+
+async fn handle_reverse_data_stream(mut mux_stream: MuxStream, local_target: &str) -> Result<()> {
     let mut local = tokio::net::TcpStream::connect(local_target)
         .await
         .with_context(|| format!("failed to dial local target {local_target}"))?;
     local.set_nodelay(true).ok();
 
-    copy_bidirectional(&mut data_stream, &mut local).await?;
+    copy_bidirectional(&mut mux_stream, &mut local).await?;
     Ok(())
 }

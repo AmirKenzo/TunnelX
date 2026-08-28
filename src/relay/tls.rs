@@ -13,6 +13,15 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 static INSTALL_CRYPTO_PROVIDER: Once = Once::new();
 
+/// Ordinary browser HTTPS traffic almost always negotiates ALPN; a TLS client
+/// that offers none is itself an anomaly some DPI heuristics flag. Advertise
+/// the same protocol list on both ends purely for handshake appearance — we
+/// don't run HTTP over this connection, so whatever gets negotiated has no
+/// effect on the tunnel itself.
+fn alpn_protocols() -> Vec<Vec<u8>> {
+    vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+}
+
 /// rustls 0.23 requires a process-wide default crypto provider to be installed
 /// before any ClientConfig/ServerConfig is built. Call this once before using
 /// anything else in this module.
@@ -40,10 +49,11 @@ pub fn build_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> 
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
 
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("failed to build TLS server config")?;
+    config.alpn_protocols = alpn_protocols();
 
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
@@ -52,7 +62,7 @@ pub fn build_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> 
 /// If `None` and `insecure` is true, skip verification entirely (testing only).
 pub fn build_connector(ca_cert_path: Option<&Path>, insecure: bool) -> Result<TlsConnector> {
     ensure_crypto_provider();
-    let config = if let Some(path) = ca_cert_path {
+    let mut config = if let Some(path) = ca_cert_path {
         let pinned = load_certs(path)?
             .into_iter()
             .next()
@@ -71,6 +81,7 @@ pub fn build_connector(ca_cert_path: Option<&Path>, insecure: bool) -> Result<Tl
             "tls transport requires either tls_ca_cert (pin the server's certificate) or tls_insecure = true"
         );
     };
+    config.alpn_protocols = alpn_protocols();
 
     Ok(TlsConnector::from(Arc::new(config)))
 }

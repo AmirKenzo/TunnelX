@@ -1,38 +1,36 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rand::Rng;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, Notify};
 use tracing::{error, info, warn};
 
 use crate::config::{ServerConfig, ServerTunnel};
-use crate::relay::protocol::{read_msg, write_msg, Message};
+use crate::relay::mux::{MuxSession, MuxStream};
+use crate::relay::protocol::{self, read_msg, write_msg, Message};
 use crate::relay::transport::{self, BoxedStream, TlsServerOpts};
-use crate::util::LogThrottle;
+use crate::util::{constant_time_eq, LogThrottle};
 
-const PENDING_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_ERROR_LOG_WINDOW: Duration = Duration::from_secs(5);
 const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// Client sends a keepalive Ping every 20s (see relay::client::KEEPALIVE_INTERVAL);
-/// if nothing at all arrives for this long the control connection is treated as
-/// dead and evicted, so new public connections fail fast instead of hanging on
-/// a registration that will never answer.
+/// if nothing at all arrives on a session's control stream for this long it's
+/// treated as dead and evicted, so new connections fail fast instead of hanging
+/// on a registration that will never answer.
 const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct State {
     config: ServerConfig,
-    /// tunnel name -> channel to push messages (mainly `NewConnection`) to that
-    /// tunnel's currently-registered control connection writer task.
-    reverse_controls: Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>,
-    /// conn_id -> the public TcpStream (plus its peer addr, captured at accept
-    /// time since it can't be reliably read back off the socket later) waiting
-    /// to be paired with a data connection.
-    pending: Mutex<HashMap<u64, (TcpStream, std::net::SocketAddr)>>,
-    next_conn_id: AtomicU64,
+    /// tunnel name -> pool of registered multiplexed sessions. Used
+    /// symmetrically by both directions: a reverse tunnel opens streams on
+    /// these to push public connections out to the client; a forward tunnel
+    /// accepts streams the client opens on these, each carrying a `ForwardConn`.
+    pools: Mutex<HashMap<String, Vec<Arc<MuxSession>>>>,
 }
 
 pub async fn run(config: ServerConfig) -> Result<()> {
@@ -48,16 +46,20 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     let listen_addr = config.listen.clone();
     let transport_kind = config.transport;
 
-    let state = Arc::new(State {
-        reverse_controls: Mutex::new(HashMap::new()),
-        pending: Mutex::new(HashMap::new()),
-        next_conn_id: AtomicU64::new(1),
-        config,
-    });
+    let state = Arc::new(State { pools: Mutex::new(HashMap::new()), config });
 
     for tunnel in &state.config.tunnels {
-        if let ServerTunnel::Reverse { name, remote_listen } = tunnel {
-            spawn_public_listener(state.clone(), name.clone(), remote_listen.clone());
+        match tunnel {
+            ServerTunnel::Reverse { name, remote_listen } => {
+                spawn_public_listener(state.clone(), name.clone(), remote_listen.clone());
+            }
+            ServerTunnel::Forward { name, allowed_targets } if allowed_targets.is_empty() => {
+                warn!(
+                    name = %name,
+                    "forward tunnel has no allowed_targets configured: anyone holding the token can reach any destination through this server"
+                );
+            }
+            ServerTunnel::Forward { .. } => {}
         }
     }
 
@@ -88,6 +90,21 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     }
 }
 
+/// Picks a live session at random from `name`'s pool, pruning dead ones along
+/// the way. Used both to push a reverse stream out and to hand a forward
+/// tunnel's inbound accept loop a session to watch (indirectly, via the pool
+/// itself in `handle_register`).
+async fn pick_session(state: &State, name: &str) -> Option<Arc<MuxSession>> {
+    let mut pools = state.pools.lock().await;
+    let sessions = pools.get_mut(name)?;
+    sessions.retain(|s| !s.is_closed());
+    if sessions.is_empty() {
+        return None;
+    }
+    let idx = rand::thread_rng().gen_range(0..sessions.len());
+    Some(sessions[idx].clone())
+}
+
 fn spawn_public_listener(state: Arc<State>, name: String, remote_listen: String) {
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(&remote_listen).await {
@@ -100,7 +117,7 @@ fn spawn_public_listener(state: Arc<State>, name: String, remote_listen: String)
         info!(name = %name, listen = %remote_listen, "reverse tunnel public listener up");
 
         let mut accept_error_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
-        let mut no_client_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
+        let mut no_session_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(p) => p,
@@ -114,37 +131,37 @@ fn spawn_public_listener(state: Arc<State>, name: String, remote_listen: String)
             };
             stream.set_nodelay(true).ok();
 
-            let control = state.reverse_controls.lock().await.get(&name).cloned();
-            let Some(control) = control else {
-                if let Some(suppressed) = no_client_throttle.allow() {
-                    warn!(name = %name, peer = %peer, suppressed, "no client connected for reverse tunnel, dropping connection(s)");
+            let Some(session) = pick_session(&state, &name).await else {
+                if let Some(suppressed) = no_session_throttle.allow() {
+                    warn!(name = %name, peer = %peer, suppressed, "no client session registered for reverse tunnel, dropping connection(s)");
                 }
                 continue;
             };
 
-            let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
-            state.pending.lock().await.insert(conn_id, (stream, peer));
-
-            if control.send(Message::NewConnection { conn_id }).is_err() {
-                state.pending.lock().await.remove(&conn_id);
-                warn!(name = %name, peer = %peer, "control connection gone, dropping connection");
-                continue;
-            }
-
-            let state = state.clone();
+            let name = name.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(PENDING_CONN_TIMEOUT).await;
-                if state.pending.lock().await.remove(&conn_id).is_some() {
-                    warn!(conn_id, "timed out waiting for client to open data connection");
-                }
+                let mut mux_stream = match session.open_stream().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(name = %name, peer = %peer, error = %e, "failed to open mux stream for reverse connection");
+                        return;
+                    }
+                };
+                let started = Instant::now();
+                let mut public_stream = stream;
+                let result = copy_bidirectional(&mut mux_stream, &mut public_stream).await;
+                log_close(&name, peer, started, result);
             });
         }
     });
 }
 
-async fn handle_connection(state: Arc<State>, mut stream: BoxedStream, peer: std::net::SocketAddr) -> Result<()> {
+async fn handle_connection(state: Arc<State>, mut stream: BoxedStream, peer: SocketAddr) -> Result<()> {
+    protocol::write_handshake(&mut stream).await?;
+    protocol::read_and_check_handshake(&mut stream).await?;
+
     match read_msg(&mut stream).await? {
-        Message::Auth { token } if token == state.config.token => {
+        Message::Auth { token } if constant_time_eq(&token, &state.config.token) => {
             write_msg(&mut stream, &Message::AuthOk).await?;
         }
         Message::Auth { .. } => {
@@ -158,9 +175,7 @@ async fn handle_connection(state: Arc<State>, mut stream: BoxedStream, peer: std
     }
 
     match read_msg(&mut stream).await? {
-        Message::RegisterReverse { name } => handle_register_reverse(state, stream, peer, name).await,
-        Message::ForwardConn { name, target } => handle_forward_conn(state, stream, peer, name, target).await,
-        Message::DataConn { conn_id } => handle_data_conn(state, stream, conn_id).await,
+        Message::Register { name } => handle_register(state, stream, peer, name).await,
         other => {
             warn!(peer = %peer, message = ?other, "unexpected message after auth");
             Ok(())
@@ -168,74 +183,128 @@ async fn handle_connection(state: Arc<State>, mut stream: BoxedStream, peer: std
     }
 }
 
-async fn handle_register_reverse(
-    state: Arc<State>,
-    stream: BoxedStream,
-    peer: std::net::SocketAddr,
-    name: String,
-) -> Result<()> {
-    let is_reverse = state
-        .config
-        .tunnels
-        .iter()
-        .any(|t| matches!(t, ServerTunnel::Reverse { name: n, .. } if n == &name));
-
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
-
-    if !is_reverse {
-        write_msg(&mut write_half, &Message::RegisterFail { reason: format!("unknown reverse tunnel '{name}'") }).await?;
+/// Registers one physical connection into `name`'s session pool (used by
+/// both forward and reverse tunnels), then dispatches every stream the peer
+/// opens on it until the session is evicted (peer disconnected, errored, or
+/// its control stream went idle).
+async fn handle_register(state: Arc<State>, mut stream: BoxedStream, peer: SocketAddr, name: String) -> Result<()> {
+    let known = state.config.tunnels.iter().any(|t| t.name() == name);
+    if !known {
+        write_msg(&mut stream, &Message::RegisterFail { reason: format!("unknown tunnel '{name}'") }).await?;
         return Ok(());
     }
 
-    write_msg(&mut write_half, &Message::RegisterOk).await?;
-    info!(name = %name, peer = %peer, "reverse tunnel client connected");
+    {
+        let pools = state.pools.lock().await;
+        let current = pools.get(&name).map(|sessions| sessions.len()).unwrap_or(0);
+        if current >= state.config.max_sessions_per_tunnel {
+            drop(pools);
+            write_msg(
+                &mut stream,
+                &Message::RegisterFail {
+                    reason: format!(
+                        "too many sessions already registered for tunnel '{name}' (max {})",
+                        state.config.max_sessions_per_tunnel
+                    ),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    }
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    state.reverse_controls.lock().await.insert(name.clone(), tx.clone());
+    write_msg(&mut stream, &Message::RegisterOk).await?;
+    info!(name = %name, peer = %peer, "tunnel session registered");
 
-    let writer_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if write_msg(&mut write_half, &msg).await.is_err() {
+    let session = Arc::new(MuxSession::new(stream, yamux::Mode::Server));
+    state.pools.lock().await.entry(name.clone()).or_default().push(session.clone());
+
+    let idle_signal = Arc::new(Notify::new());
+
+    loop {
+        tokio::select! {
+            maybe_stream = session.accept_stream() => match maybe_stream {
+                Some(mux_stream) => {
+                    let state = state.clone();
+                    let name = name.clone();
+                    let idle_signal = idle_signal.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_inbound_stream(state, name, peer, mux_stream, idle_signal).await {
+                            warn!(peer = %peer, error = %e, "inbound mux stream handling failed");
+                        }
+                    });
+                }
+                None => break,
+            },
+            _ = idle_signal.notified() => {
+                warn!(name = %name, peer = %peer, "session control stream idle/dead, evicting");
                 break;
             }
         }
-    });
+    }
 
+    let mut pools = state.pools.lock().await;
+    if let Some(pool) = pools.get_mut(&name) {
+        pool.retain(|s| !Arc::ptr_eq(s, &session));
+        if pool.is_empty() {
+            pools.remove(&name);
+        }
+    }
+    info!(name = %name, peer = %peer, "tunnel session disconnected");
+    Ok(())
+}
+
+/// Every stream a registered session's peer opens lands here first: it's
+/// either that session's one dedicated control/ping stream, or (for a
+/// forward tunnel) a fresh `ForwardConn` data stream.
+async fn handle_inbound_stream(
+    state: Arc<State>,
+    name: String,
+    peer: SocketAddr,
+    mut stream: MuxStream,
+    idle_signal: Arc<Notify>,
+) -> Result<()> {
+    match read_msg(&mut stream).await? {
+        Message::Ping { ts_millis } => handle_control_stream(name, peer, stream, ts_millis, idle_signal).await,
+        Message::ForwardConn { name: fwd_name, target } => handle_forward_conn(state, peer, fwd_name, target, stream).await,
+        other => {
+            warn!(peer = %peer, message = ?other, "unexpected first message on mux stream");
+            Ok(())
+        }
+    }
+}
+
+async fn handle_control_stream(
+    name: String,
+    peer: SocketAddr,
+    mut stream: MuxStream,
+    first_ts_millis: u64,
+    idle_signal: Arc<Notify>,
+) -> Result<()> {
+    write_msg(&mut stream, &Message::Pong { ts_millis: first_ts_millis }).await?;
     loop {
-        match tokio::time::timeout(CONTROL_IDLE_TIMEOUT, read_msg(&mut read_half)).await {
+        match tokio::time::timeout(CONTROL_IDLE_TIMEOUT, read_msg(&mut stream)).await {
             Ok(Ok(Message::Ping { ts_millis })) => {
-                if tx.send(Message::Pong { ts_millis }).is_err() {
-                    break;
-                }
+                write_msg(&mut stream, &Message::Pong { ts_millis }).await?;
             }
             Ok(Ok(_)) => {}
             Ok(Err(_)) => break,
             Err(_elapsed) => {
-                warn!(name = %name, peer = %peer, "reverse control connection idle, treating as dead");
+                warn!(name = %name, peer = %peer, "control stream idle, treating session as dead");
                 break;
             }
         }
     }
-
-    writer_task.abort();
-    // Only remove the registry entry if it's still ours (a newer reconnect may
-    // have already replaced it).
-    let mut controls = state.reverse_controls.lock().await;
-    if let Some(current) = controls.get(&name) {
-        if current.same_channel(&tx) {
-            controls.remove(&name);
-        }
-    }
-    info!(name = %name, peer = %peer, "reverse tunnel client disconnected");
+    idle_signal.notify_one();
     Ok(())
 }
 
 async fn handle_forward_conn(
     state: Arc<State>,
-    mut stream: BoxedStream,
-    peer: std::net::SocketAddr,
+    peer: SocketAddr,
     name: String,
     target: String,
+    mut stream: MuxStream,
 ) -> Result<()> {
     let rule = state.config.tunnels.iter().find_map(|t| match t {
         ServerTunnel::Forward { name: n, allowed_targets } if n == &name => Some(allowed_targets.clone()),
@@ -243,7 +312,7 @@ async fn handle_forward_conn(
     });
 
     let Some(allowed_targets) = rule else {
-        warn!(name = %name, peer = %peer, "forward request for unknown tunnel name");
+        warn!(name = %name, peer = %peer, "forward request for unknown/non-forward tunnel name");
         return Ok(());
     };
 
@@ -268,24 +337,7 @@ async fn handle_forward_conn(
     Ok(())
 }
 
-async fn handle_data_conn(state: Arc<State>, mut stream: BoxedStream, conn_id: u64) -> Result<()> {
-    let Some((mut public_stream, peer)) = state.pending.lock().await.remove(&conn_id) else {
-        warn!(conn_id, "data connection for unknown or expired conn_id");
-        return Ok(());
-    };
-
-    let started = Instant::now();
-    let result = copy_bidirectional(&mut stream, &mut public_stream).await;
-    log_close("reverse", peer, started, result);
-    Ok(())
-}
-
-fn log_close(
-    name: &str,
-    peer: std::net::SocketAddr,
-    started: Instant,
-    result: std::io::Result<(u64, u64)>,
-) {
+fn log_close(name: &str, peer: SocketAddr, started: Instant, result: std::io::Result<(u64, u64)>) {
     let elapsed = started.elapsed();
     match result {
         Ok((tx, rx)) => info!(

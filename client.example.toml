@@ -8,6 +8,7 @@ transport = "wss"          # must match the server's transport
 token = "change-me-to-a-long-random-string"   # must match the server's token
 tls_ca_cert = "cert.pem"   # the server's cert.pem, copied over (see tests/gencert.md)
 # tls_insecure = true      # alternative to tls_ca_cert: skip verification entirely
+mux_connections = 4        # physical connections kept open per tunnel, each multiplexing many proxied connections
 
 [[tunnel]]
 name = "ssh-out"

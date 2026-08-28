@@ -10,6 +10,14 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_mux_connections() -> usize {
+    4
+}
+
+fn default_max_sessions_per_tunnel() -> usize {
+    8
+}
+
 /// Top-level config. `mode` decides which of the three shapes below applies;
 /// it's optional and defaults to "direct" so existing direct-mode config
 /// files (no `mode` key) keep working unchanged.
@@ -138,6 +146,14 @@ pub struct ClientConfig {
     pub tls_ca_cert: Option<PathBuf>,
     #[serde(default)]
     pub tls_insecure: bool,
+    /// How many physical connections to keep open per tunnel, each carrying
+    /// many multiplexed logical streams. More than 1 limits how much traffic
+    /// a single degraded/black-holed physical link or a single TCP-level
+    /// head-of-line-blocking event can affect at once; there's little
+    /// latency argument for a large pool since multiplexing already removes
+    /// the per-connection handshake cost.
+    #[serde(default = "default_mux_connections")]
+    pub mux_connections: usize,
     #[serde(rename = "tunnel")]
     pub tunnels: Vec<ClientTunnel>,
 }
@@ -171,6 +187,10 @@ impl ClientConfig {
 
         if self.transport.is_tls() && self.tls_ca_cert.is_none() && !self.tls_insecure {
             bail!("transport {:?} requires tls_ca_cert (pin the server's cert) or tls_insecure = true", self.transport);
+        }
+
+        if self.mux_connections == 0 {
+            bail!("mux_connections must be at least 1");
         }
 
         if self.tunnels.is_empty() {
@@ -210,6 +230,13 @@ pub struct ServerConfig {
     pub token: String,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// Caps how many physical sessions the server will register per tunnel
+    /// name, so a misbehaving or duplicated client can't grow this
+    /// unboundedly. Defaults to twice the client's default `mux_connections`
+    /// pool size, leaving headroom for one full extra generation of sessions
+    /// to overlap during a client-side reconnect without hitting the cap.
+    #[serde(default = "default_max_sessions_per_tunnel")]
+    pub max_sessions_per_tunnel: usize,
     #[serde(rename = "tunnel")]
     pub tunnels: Vec<ServerTunnel>,
 }
@@ -243,6 +270,10 @@ impl ServerConfig {
 
         if self.transport.is_tls() && (self.tls_cert.is_none() || self.tls_key.is_none()) {
             bail!("transport {:?} requires tls_cert and tls_key", self.transport);
+        }
+
+        if self.max_sessions_per_tunnel == 0 {
+            bail!("max_sessions_per_tunnel must be at least 1");
         }
 
         if self.tunnels.is_empty() {

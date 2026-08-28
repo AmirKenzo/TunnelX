@@ -100,16 +100,24 @@ where
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Deliberately does NOT send a WebSocket Close frame here.
         //
-        // `copy_bidirectional` calls `shutdown()` on one direction as soon as
-        // its read side hits EOF, while the *other* direction (sharing this
-        // same socket) may still have in-flight data to write. A WS Close is
-        // a whole-connection teardown, not a half-close like TCP's
-        // shutdown(SHUT_WR): once sent (or once tungstenite auto-echoes a
-        // peer's Close), any further data send on this connection fails with
-        // "Sending after closing is not allowed", aborting the still-active
-        // direction and dropping its buffered data. Treat shutdown as a
-        // local no-op instead; the underlying TCP/TLS socket is torn down
-        // for real when `WsIo` is dropped once both copy directions finish.
+        // A WS Close is a whole-connection teardown, not a half-close like
+        // TCP's shutdown(SHUT_WR): once sent (or once tungstenite auto-echoes
+        // a peer's Close), any further data send on this connection fails
+        // with "Sending after closing is not allowed". `copy_bidirectional`
+        // calls `shutdown()` on one direction as soon as its read side hits
+        // EOF, which used to trigger exactly that — a still-active peer
+        // direction sharing this same socket would get its in-flight data
+        // silently dropped and the whole proxied connection aborted.
+        //
+        // Since the yamux multiplexing layer was introduced, `WsIo` is only
+        // ever the transport underneath a `relay::mux::MuxSession` — nothing
+        // calls `copy_bidirectional` directly on it anymore (that now only
+        // ever runs on individual `yamux::Stream`s, which have their own
+        // real per-stream half-close). So this no-op should rarely if ever
+        // actually fire in practice; it's kept as cheap, correct-regardless-
+        // of-caller insurance. The underlying TCP/TLS socket is still torn
+        // down for real when `WsIo` (and the `yamux::Connection` above it) is
+        // dropped once the session ends.
         Poll::Ready(Ok(()))
     }
 }

@@ -8,6 +8,7 @@ transport = "wss"          # tcp | tls | ws | wss
 token = "change-me-to-a-long-random-string"
 tls_cert = "cert.pem"      # only needed for transport = tls or wss (see tests/gencert.md)
 tls_key = "key.pem"
+max_sessions_per_tunnel = 8   # caps how many client sessions may register per tunnel name
 
 [[tunnel]]
 name = "ssh-out"
