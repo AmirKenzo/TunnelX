@@ -17,6 +17,11 @@ use crate::util::LogThrottle;
 const PENDING_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_ERROR_LOG_WINDOW: Duration = Duration::from_secs(5);
 const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(50);
+/// Client sends a keepalive Ping every 20s (see relay::client::KEEPALIVE_INTERVAL);
+/// if nothing at all arrives for this long the control connection is treated as
+/// dead and evicted, so new public connections fail fast instead of hanging on
+/// a registration that will never answer.
+const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct State {
     config: ServerConfig,
@@ -197,14 +202,18 @@ async fn handle_register_reverse(
     });
 
     loop {
-        match read_msg(&mut read_half).await {
-            Ok(Message::Ping { ts_millis }) => {
+        match tokio::time::timeout(CONTROL_IDLE_TIMEOUT, read_msg(&mut read_half)).await {
+            Ok(Ok(Message::Ping { ts_millis })) => {
                 if tx.send(Message::Pong { ts_millis }).is_err() {
                     break;
                 }
             }
-            Ok(_) => {}
-            Err(_) => break,
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => break,
+            Err(_elapsed) => {
+                warn!(name = %name, peer = %peer, "reverse control connection idle, treating as dead");
+                break;
+            }
         }
     }
 

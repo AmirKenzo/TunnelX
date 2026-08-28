@@ -53,6 +53,11 @@ pub async fn run(config: ClientConfig) -> Result<()> {
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+/// If no pong has been seen for this long, the control connection is treated
+/// as dead even though reads/writes on the socket itself haven't errored
+/// (e.g. traffic silently black-holed instead of RST/FIN'd) so we reconnect
+/// instead of waiting indefinitely for a link that will never come back.
+const PONG_TIMEOUT: Duration = Duration::from_secs(45);
 
 fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -194,6 +199,7 @@ async fn run_reverse_once(config: &ClientConfig, tls: &TlsClientOpts, name: &str
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     let mut keepalive = interval(KEEPALIVE_INTERVAL);
     keepalive.tick().await; // first tick fires immediately, skip it
+    let mut last_pong = Instant::now();
 
     loop {
         tokio::select! {
@@ -215,12 +221,19 @@ async fn run_reverse_once(config: &ClientConfig, tls: &TlsClientOpts, name: &str
                         });
                     }
                     Message::Pong { ts_millis } => {
+                        last_pong = Instant::now();
                         tracing::debug!(name = %name, rtt_ms = now_millis().saturating_sub(ts_millis), "keepalive pong received");
                     }
                     other => warn!(name = %name, message = ?other, "unexpected message on reverse control connection"),
                 }
             }
             _ = keepalive.tick() => {
+                if last_pong.elapsed() > PONG_TIMEOUT {
+                    bail!(
+                        "no pong received in over {:?}, control connection appears dead",
+                        PONG_TIMEOUT
+                    );
+                }
                 write_msg(&mut write_half, &Message::Ping { ts_millis: now_millis() }).await?;
             }
         }

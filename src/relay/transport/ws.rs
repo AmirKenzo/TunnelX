@@ -97,7 +97,19 @@ where
         Pin::new(&mut self.inner).poll_flush(cx).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_close(cx).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Deliberately does NOT send a WebSocket Close frame here.
+        //
+        // `copy_bidirectional` calls `shutdown()` on one direction as soon as
+        // its read side hits EOF, while the *other* direction (sharing this
+        // same socket) may still have in-flight data to write. A WS Close is
+        // a whole-connection teardown, not a half-close like TCP's
+        // shutdown(SHUT_WR): once sent (or once tungstenite auto-echoes a
+        // peer's Close), any further data send on this connection fails with
+        // "Sending after closing is not allowed", aborting the still-active
+        // direction and dropping its buffered data. Treat shutdown as a
+        // local no-op instead; the underlying TCP/TLS socket is torn down
+        // for real when `WsIo` is dropped once both copy directions finish.
+        Poll::Ready(Ok(()))
     }
 }
