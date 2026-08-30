@@ -243,6 +243,15 @@ async fn handle_register(state: Arc<State>, mut stream: BoxedStream, peer: Socke
         }
     }
 
+    // Forceful, immediate teardown -- not just removing our clone from the
+    // pool -- so the physical socket doesn't linger open for however long a
+    // concurrent forward-tunnel data stream or a reverse connection that
+    // already grabbed this session (via spawn_public_listener/pick_session)
+    // is still relaying traffic through it. Those were sharing this same
+    // physical connection, so if its control stream just died they're
+    // already doomed anyway; better to fail them promptly than leak the fd.
+    session.close();
+
     let mut pools = state.pools.lock().await;
     if let Some(pool) = pools.get_mut(&name) {
         pool.retain(|s| !Arc::ptr_eq(s, &session));

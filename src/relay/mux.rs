@@ -48,6 +48,7 @@ type OpenReply = oneshot::Sender<Result<yamux::Stream>>;
 pub struct MuxSession {
     open_tx: mpsc::Sender<OpenReply>,
     inbound_rx: AsyncMutex<mpsc::Receiver<yamux::Stream>>,
+    driver: tokio::task::JoinHandle<()>,
 }
 
 impl MuxSession {
@@ -62,9 +63,26 @@ impl MuxSession {
         let (open_tx, open_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
 
-        tokio::spawn(drive(connection, open_rx, inbound_tx));
+        let driver = tokio::spawn(drive(connection, open_rx, inbound_tx));
 
-        Self { open_tx, inbound_rx: AsyncMutex::new(inbound_rx) }
+        Self { open_tx, inbound_rx: AsyncMutex::new(inbound_rx), driver }
+    }
+
+    /// Forcefully tears down the physical connection right now, regardless of
+    /// whether some other `Arc<MuxSession>` clone is still using this session
+    /// (e.g. a concurrent caller mid-flight in `open_stream()` or relaying
+    /// traffic through a stream it already opened). Relying on plain Arc
+    /// refcounting for this is not enough: a session's owner deciding "this
+    /// is dead, evict it" only *asks* for cleanup that way, and the real
+    /// socket stays open for as long as whatever unrelated task is still
+    /// holding a clone — which, on a proxy relaying arbitrary traffic, has no
+    /// bound. Aborting the driver task drops its `yamux::Connection` (and the
+    /// physical socket underneath it) immediately. Any other clone still
+    /// trying to use this session gets a prompt error instead of hanging,
+    /// since aborting drops `open_rx`/the inbound channel too. Call this
+    /// exactly when a session is removed from its pool.
+    pub fn close(&self) {
+        self.driver.abort();
     }
 
     /// Opens a new outbound logical stream. May be called concurrently from
@@ -95,6 +113,15 @@ impl MuxSession {
     /// for an `open_stream()` call against it to fail.
     pub fn is_closed(&self) -> bool {
         self.open_tx.is_closed()
+    }
+}
+
+impl Drop for MuxSession {
+    fn drop(&mut self) {
+        // Backstop for any path that forgets to call `close()` explicitly:
+        // the physical connection is reclaimed the moment the last handle
+        // goes away, not just when someone remembers to ask for it.
+        self.driver.abort();
     }
 }
 
@@ -140,11 +167,20 @@ async fn drive(
                 let _ = reply.send(res.map_err(|e| anyhow!("failed to open outbound mux stream: {e}")));
             }
             DriverStep::Inbound(Some(Ok(stream))) => {
-                // If the bounded channel is full because nobody is currently
-                // calling accept_stream(), this backpressures poll_next_inbound
-                // too (fine: yamux buffers at the protocol level up to its own
-                // limits) rather than dropping the stream.
-                let _ = inbound_tx.send(stream).await;
+                // A blocking send here would stall this entire connection --
+                // including servicing outbound `open_stream()` requests --
+                // for as long as nobody happens to be draining
+                // `accept_stream()`. Best case that's just slow; worst case
+                // (a session nobody ever accepts on, e.g. a peer misbehaving
+                // on a forward-tunnel session that should never receive
+                // inbound streams at all) it's an indefinite hang that pins
+                // the physical connection open. Drop and move on instead --
+                // a dropped stream just looks like a failed connection to
+                // whoever opened it, which is recoverable; a stuck driver
+                // task is not.
+                if inbound_tx.try_send(stream).is_err() {
+                    warn!("inbound stream queue full or unclaimed, dropping accepted stream");
+                }
             }
             DriverStep::Inbound(Some(Err(e))) => {
                 warn!(error = %e, "yamux connection error, tearing down session");

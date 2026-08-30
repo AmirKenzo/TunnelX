@@ -256,6 +256,11 @@ async fn run_forward_session_once(config: &ClientConfig, tls: &TlsClientOpts, na
     let session = Arc::new(establish_pooled_session(config, tls, name).await?);
     pool.lock().await.push(session.clone());
     let result = run_ping_stream(&session, name).await;
+    // Forceful, immediate teardown -- not just removing our clone from the
+    // pool -- so the physical socket doesn't linger open for however long a
+    // concurrent handle_forward_conn() that already grabbed this session is
+    // still relaying traffic through it.
+    session.close();
     pool.lock().await.retain(|s| !Arc::ptr_eq(s, &session));
     result
 }
@@ -322,6 +327,11 @@ async fn run_reverse_session_once(
         r = accept_reverse_connections(&session, name, local_target) => r,
     };
 
+    // See the matching comment in run_forward_session_once: forceful,
+    // immediate teardown so an in-flight reverse data stream elsewhere can't
+    // keep this physical socket open indefinitely after we've declared the
+    // session dead.
+    session.close();
     pool.lock().await.retain(|s| !Arc::ptr_eq(s, &session));
     result
 }
