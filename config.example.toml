@@ -1,5 +1,6 @@
 # tunnelx config — list of TCP forwarding rules.
 # Each rule opens `listen` locally and forwards every connection to `target`.
+# For SNI-aware forwarding (allowed_sni + random target pool), see sni.example.toml.
 
 # Log verbosity: off, error, warn, info, debug, trace. Optional, defaults to "info".
 # Changing this and saving the file applies it live, no restart needed.

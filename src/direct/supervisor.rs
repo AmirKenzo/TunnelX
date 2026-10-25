@@ -21,7 +21,7 @@ struct ActiveRule {
 /// Runs all forward rules and watches the config file for changes, hot-reloading
 /// added/removed/changed rules without restarting the whole process. A rule whose
 /// `listen` address didn't change keeps its listener socket bound (no dropped
-/// connections mid-reload); only `target` is updated live. A changed `listen`
+/// connections mid-reload); only `target`/`targets`/`allowed_sni` are updated live. A changed `listen`
 /// (or a removed/added rule) rebinds just that one listener.
 pub async fn run(config_path: PathBuf, initial: crate::config::DirectConfig, log_handle: logging::Handle) {
     let mut current_log_level = initial.log_level.clone();
@@ -92,7 +92,7 @@ async fn reload(active: &mut HashMap<String, ActiveRule>, registry: &Registry, n
     for (name, rule) in &new_rules {
         match old_rules.get(name) {
             None => {
-                info!(name = %name, listen = %rule.listen, target = %rule.target, "forward added");
+                info!(name = %name, listen = %rule.listen, targets = ?rule.target_pool(), allowed_sni = ?rule.allowed_sni, "forward added");
                 to_spawn.push(rule.clone());
             }
             Some(existing) if existing.listen != rule.listen => {
@@ -102,8 +102,11 @@ async fn reload(active: &mut HashMap<String, ActiveRule>, registry: &Registry, n
                 info!(name = %name, old_listen = %existing.listen, new_listen = %rule.listen, "forward listen address changed, rebinding");
                 to_spawn.push(rule.clone());
             }
-            Some(existing) if existing.target != rule.target => {
-                info!(name = %name, old_target = %existing.target, new_target = %rule.target, "forward target updated");
+            Some(existing) if existing.target_pool() != rule.target_pool() => {
+                info!(name = %name, old_targets = ?existing.target_pool(), new_targets = ?rule.target_pool(), "forward target updated");
+            }
+            Some(existing) if existing.allowed_sni != rule.allowed_sni => {
+                info!(name = %name, old_allowed_sni = ?existing.allowed_sni, new_allowed_sni = ?rule.allowed_sni, "forward allowed_sni updated");
             }
             _ => {}
         }

@@ -94,7 +94,21 @@ pub struct DirectConfig {
 pub struct ForwardRule {
     pub name: String,
     pub listen: String,
-    pub target: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub allowed_sni: Vec<String>,
+}
+
+impl ForwardRule {
+    pub fn target_pool(&self) -> Vec<String> {
+        match &self.target {
+            Some(target) => vec![target.clone()],
+            None => self.targets.clone(),
+        }
+    }
 }
 
 impl DirectConfig {
@@ -116,9 +130,27 @@ impl DirectConfig {
             rule.listen.parse::<std::net::SocketAddr>().with_context(|| {
                 format!("forward '{}': invalid listen address '{}'", rule.name, rule.listen)
             })?;
-            rule.target.parse::<std::net::SocketAddr>().with_context(|| {
-                format!("forward '{}': invalid target address '{}'", rule.name, rule.target)
-            })?;
+            match (&rule.target, rule.targets.is_empty()) {
+                (Some(_), false) => {
+                    bail!("forward '{}': set either 'target' or 'targets', not both", rule.name)
+                }
+                (None, true) => bail!("forward '{}': must set 'target' or a non-empty 'targets'", rule.name),
+                _ => {}
+            }
+            for target in rule.target_pool() {
+                target.parse::<std::net::SocketAddr>().with_context(|| {
+                    format!("forward '{}': invalid target address '{}'", rule.name, target)
+                })?;
+            }
+            for pattern in &rule.allowed_sni {
+                let valid = match pattern.strip_prefix("*.") {
+                    Some(suffix) => !suffix.is_empty() && !suffix.contains('*'),
+                    None => !pattern.is_empty() && !pattern.contains('*'),
+                };
+                if !valid {
+                    bail!("forward '{}': invalid allowed_sni pattern '{}'", rule.name, pattern);
+                }
+            }
             if !seen_listen.insert(rule.listen.clone()) {
                 bail!("duplicate listen address '{}' in config", rule.listen);
             }
@@ -313,4 +345,65 @@ fn validate_log_level(level: &str) -> Result<()> {
         bail!("invalid log_level '{level}' (expected one of: {})", VALID_LEVELS.join(", "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_direct(raw: &str) -> Result<DirectConfig> {
+        match Config::parse(raw)? {
+            Config::Direct(c) => Ok(c),
+            _ => bail!("expected direct config"),
+        }
+    }
+
+    #[test]
+    fn plain_target_rule_ok() {
+        let c = parse_direct("[[forward]]\nname = \"ssh\"\nlisten = \"0.0.0.0:2222\"\ntarget = \"1.2.3.4:22\"\n").unwrap();
+        assert_eq!(c.forwards[0].target_pool(), vec!["1.2.3.4:22".to_string()]);
+        assert!(c.forwards[0].allowed_sni.is_empty());
+    }
+
+    #[test]
+    fn targets_only_ok() {
+        let c = parse_direct(
+            "[[forward]]\nname = \"cf\"\nlisten = \"0.0.0.0:3256\"\nallowed_sni = [\"a.ir\", \"*.sni.ir\"]\ntargets = [\"1.1.1.1:443\", \"1.0.0.1:443\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.forwards[0].target_pool().len(), 2);
+    }
+
+    #[test]
+    fn both_target_and_targets_rejected() {
+        let err = parse_direct(
+            "[[forward]]\nname = \"cf\"\nlisten = \"0.0.0.0:3256\"\ntarget = \"1.1.1.1:443\"\ntargets = [\"1.0.0.1:443\"]\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn neither_target_nor_targets_rejected() {
+        assert!(parse_direct("[[forward]]\nname = \"cf\"\nlisten = \"0.0.0.0:3256\"\n").is_err());
+        assert!(parse_direct("[[forward]]\nname = \"cf\"\nlisten = \"0.0.0.0:3256\"\ntargets = []\n").is_err());
+    }
+
+    #[test]
+    fn invalid_pool_entry_rejected() {
+        assert!(parse_direct(
+            "[[forward]]\nname = \"cf\"\nlisten = \"0.0.0.0:3256\"\ntargets = [\"1.1.1.1:443\", \"nope\"]\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bad_sni_pattern_rejected() {
+        for pattern in ["", "*.", "*", "a.*.ir"] {
+            let raw = format!(
+                "[[forward]]\nname = \"cf\"\nlisten = \"0.0.0.0:3256\"\ntarget = \"1.1.1.1:443\"\nallowed_sni = [\"{pattern}\"]\n"
+            );
+            assert!(parse_direct(&raw).is_err(), "pattern {pattern:?} should be rejected");
+        }
+    }
 }

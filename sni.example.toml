@@ -1,0 +1,24 @@
+log_level = "info"
+
+# Only connections whose SNI is in allowed_sni are forwarded; everything else is dropped.
+[[forward]]
+name = "cf-relay"
+listen = "0.0.0.0:443"
+allowed_sni = [
+    "ak.ir",
+    "*.sni.ir",
+]
+targets = [
+    "104.16.0.1:443",
+    "104.17.0.1:443",
+    "172.67.0.1:443",
+]
+
+# No allowed_sni: every connection (any SNI, or non-TLS) is forwarded to a random target.
+[[forward]]
+name = "cf-open"
+listen = "0.0.0.0:8443"
+targets = [
+    "104.16.0.1:443",
+    "104.17.0.1:443",
+]
