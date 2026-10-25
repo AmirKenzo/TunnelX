@@ -16,6 +16,7 @@ use crate::util::LogThrottle;
 
 const ACCEPT_ERROR_LOG_WINDOW: Duration = Duration::from_secs(5);
 const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(50);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 const RECONNECT_BACKOFF: [Duration; 5] = [
     Duration::from_millis(500),
@@ -107,7 +108,19 @@ async fn pick_session(pool: &SessionPool) -> Option<Arc<MuxSession>> {
 /// Dials, version-checks, authenticates, and registers one physical
 /// connection, then wraps it as a multiplexed session. Used to establish
 /// every pooled session for both forward and reverse tunnels.
+///
+/// Wrapped in an overall timeout: without one, a connection that gets
+/// silently black-holed anywhere in the dial/TLS/WS/auth sequence (a dropped
+/// SYN, a middlebox eating the TLS ClientHello, etc.) would hang this attempt
+/// forever with nothing logged and no reconnect ever triggered, since nothing
+/// here reads with a deadline the way the steady-state ping loop does.
 async fn establish_pooled_session(config: &ClientConfig, tls: &TlsClientOpts, name: &str) -> Result<MuxSession> {
+    tokio::time::timeout(CONNECT_TIMEOUT, establish_pooled_session_inner(config, tls, name))
+        .await
+        .map_err(|_| anyhow!("timed out connecting/registering with server within {CONNECT_TIMEOUT:?}"))?
+}
+
+async fn establish_pooled_session_inner(config: &ClientConfig, tls: &TlsClientOpts, name: &str) -> Result<MuxSession> {
     let mut stream = transport::dial(config.transport, &config.server, tls)
         .await
         .context("failed to connect to server")?;
