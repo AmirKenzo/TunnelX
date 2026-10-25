@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::io;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use rand::seq::SliceRandom;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use socket2::{SockRef, TcpKeepalive};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -14,13 +17,18 @@ use crate::util::LogThrottle;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SNI_READ_TIMEOUT: Duration = Duration::from_secs(5);
-const SNI_DROP_LOG_WINDOW: Duration = Duration::from_secs(5);
+const DROP_LOG_WINDOW: Duration = Duration::from_secs(5);
 const MAX_CLIENT_HELLO_RECORD: usize = 16384 + 2048;
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const COPY_BUF_SIZE: usize = 8 * 1024;
 const ACCEPT_ERROR_LOG_WINDOW: Duration = Duration::from_secs(5);
 const ACCEPT_ERROR_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub type Registry = Arc<RwLock<HashMap<String, ForwardRule>>>;
 
+/// Binds `listen` once and runs forever, forwarding each connection to the
+/// current `target` for `name` (read live from `registry` on every accept,
+/// so changing just the target in the config doesn't require rebinding).
 pub async fn run(name: String, listen: String, registry: Registry) -> Result<()> {
     let listener = TcpListener::bind(&listen)
         .await
@@ -29,7 +37,8 @@ pub async fn run(name: String, listen: String, registry: Registry) -> Result<()>
     info!(name = %name, listen = %listen, "listening");
 
     let mut accept_error_throttle = LogThrottle::new(ACCEPT_ERROR_LOG_WINDOW);
-    let sni_drop_throttle = Arc::new(Mutex::new(LogThrottle::new(SNI_DROP_LOG_WINDOW)));
+    let drop_throttle = Arc::new(Mutex::new(LogThrottle::new(DROP_LOG_WINDOW)));
+    let active = Arc::new(AtomicUsize::new(0));
     loop {
         let (inbound, peer_addr) = match listener.accept().await {
             Ok(pair) => pair,
@@ -44,14 +53,38 @@ pub async fn run(name: String, listen: String, registry: Registry) -> Result<()>
 
         let name = name.clone();
         let registry = registry.clone();
-        let sni_drop_throttle = sni_drop_throttle.clone();
+        let drop_throttle = drop_throttle.clone();
+        let guard = ActiveGuard::new(active.clone());
         tokio::spawn(async move {
+            let guard = guard;
             let rule = match registry.read().await.get(&name).cloned() {
                 Some(rule) => rule,
                 None => return, // rule was removed by a reload just as we accepted
             };
-            handle_connection(name, rule, inbound, peer_addr, sni_drop_throttle).await;
+            if rule.max_connections > 0 && guard.count > rule.max_connections {
+                log_dropped(&drop_throttle, &name, peer_addr, None, "connection limit reached");
+                return;
+            }
+            handle_connection(name, rule, inbound, peer_addr, drop_throttle).await;
         });
+    }
+}
+
+struct ActiveGuard {
+    counter: Arc<AtomicUsize>,
+    count: usize,
+}
+
+impl ActiveGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        Self { counter, count }
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -60,9 +93,10 @@ async fn handle_connection(
     rule: ForwardRule,
     mut inbound: TcpStream,
     peer_addr: std::net::SocketAddr,
-    sni_drop_throttle: Arc<Mutex<LogThrottle>>,
+    drop_throttle: Arc<Mutex<LogThrottle>>,
 ) {
     let _ = inbound.set_nodelay(true);
+    set_keepalive(&inbound, rule.keepalive_secs);
 
     let mut sni: Option<String> = None;
     let mut consumed: Vec<u8> = Vec::new();
@@ -84,10 +118,7 @@ async fn handle_connection(
             Err(_) => Some("client hello read timed out".to_string()),
         };
         if let Some(reason) = reason {
-            let allowed = sni_drop_throttle.lock().map(|mut t| t.allow()).unwrap_or(Some(0));
-            if let Some(suppressed) = allowed {
-                warn!(name = %name, peer = %peer_addr, sni = sni.as_deref(), reason = %reason, suppressed, "connection dropped");
-            }
+            log_dropped(&drop_throttle, &name, peer_addr, sni.as_deref(), &reason);
             return;
         }
     }
@@ -116,21 +147,24 @@ async fn handle_connection(
         }
     };
     let _ = outbound.set_nodelay(true);
+    set_keepalive(&outbound, rule.keepalive_secs);
 
     info!(name = %name, peer = %peer_addr, target = %target, sni = sni.as_deref(), "connection open");
     let started = Instant::now();
 
     let mut outbound = outbound;
+    let sent = AtomicU64::new(consumed.len() as u64);
+    let received = AtomicU64::new(0);
+    let idle_timeout = Duration::from_secs(rule.idle_timeout_secs);
     let result = match outbound.write_all(&consumed).await {
-        Ok(()) => copy_bidirectional(&mut inbound, &mut outbound)
-            .await
-            .map(|(tx, rx)| (tx + consumed.len() as u64, rx)),
+        Ok(()) => relay(&mut inbound, &mut outbound, idle_timeout, &sent, &received).await,
         Err(e) => Err(e),
     };
 
     let elapsed = started.elapsed();
+    let (tx, rx) = (sent.load(Ordering::Relaxed), received.load(Ordering::Relaxed));
     match result {
-        Ok((tx, rx)) => {
+        Ok(idle) => {
             info!(
                 name = %name,
                 peer = %peer_addr,
@@ -139,6 +173,7 @@ async fn handle_connection(
                 sent = tx,
                 received = rx,
                 duration_ms = elapsed.as_millis(),
+                idle_timeout = idle,
                 "connection closed"
             );
         }
@@ -148,11 +183,98 @@ async fn handle_connection(
                 peer = %peer_addr,
                 target = %target,
                 sni = sni.as_deref(),
+                sent = tx,
+                received = rx,
                 duration_ms = elapsed.as_millis(),
                 error = %e,
                 "connection closed with error"
             );
         }
+    }
+}
+
+fn log_dropped(
+    throttle: &Mutex<LogThrottle>,
+    name: &str,
+    peer_addr: std::net::SocketAddr,
+    sni: Option<&str>,
+    reason: &str,
+) {
+    let allowed = throttle.lock().map(|mut t| t.allow()).unwrap_or(Some(0));
+    if let Some(suppressed) = allowed {
+        warn!(name = %name, peer = %peer_addr, sni, reason = %reason, suppressed, "connection dropped");
+    }
+}
+
+fn set_keepalive(stream: &TcpStream, secs: u64) {
+    if secs == 0 {
+        return;
+    }
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(secs))
+        .with_interval(KEEPALIVE_INTERVAL);
+    let _ = SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
+/// Returns `Ok(true)` when the connection was closed by `idle_timeout`.
+async fn relay(
+    inbound: &mut TcpStream,
+    outbound: &mut TcpStream,
+    idle_timeout: Duration,
+    sent: &AtomicU64,
+    received: &AtomicU64,
+) -> io::Result<bool> {
+    let started = Instant::now();
+    let last_activity = AtomicU64::new(0);
+    let (mut inbound_read, mut inbound_write) = inbound.split();
+    let (mut outbound_read, mut outbound_write) = outbound.split();
+    let copy = async {
+        tokio::try_join!(
+            copy_half(&mut inbound_read, &mut outbound_write, sent, &last_activity, started),
+            copy_half(&mut outbound_read, &mut inbound_write, received, &last_activity, started),
+        )
+        .map(|_| false)
+    };
+
+    if idle_timeout.is_zero() {
+        return copy.await;
+    }
+    tokio::select! {
+        result = copy => result,
+        _ = idle_watch(started, &last_activity, idle_timeout) => Ok(true),
+    }
+}
+
+async fn copy_half<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    total: &AtomicU64,
+    last_activity: &AtomicU64,
+    started: Instant,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; COPY_BUF_SIZE];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return writer.shutdown().await;
+        }
+        writer.write_all(&buf[..n]).await?;
+        total.fetch_add(n as u64, Ordering::Relaxed);
+        last_activity.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
+async fn idle_watch(started: Instant, last_activity: &AtomicU64, idle_timeout: Duration) {
+    loop {
+        let deadline = started + Duration::from_millis(last_activity.load(Ordering::Relaxed)) + idle_timeout;
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep_until(deadline.into()).await;
     }
 }
 
@@ -307,5 +429,62 @@ mod tests {
         assert!(sni_matches("A.Sni.Ir", "*.SNI.ir"));
         assert!(sni_matches("nativeplus.ir.", "nativeplus.ir"));
         assert!(sni_matches("a.sni.ir.", "*.sni.ir"));
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn relay_copies_both_ways_until_close() {
+        let (mut client, mut inbound) = tcp_pair().await;
+        let (mut outbound, mut backend) = tcp_pair().await;
+        let (sent, received) = (AtomicU64::new(0), AtomicU64::new(0));
+
+        let peers = async {
+            client.write_all(b"ping").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            backend.read_to_end(&mut buf).await.unwrap();
+            assert_eq!(buf, b"ping");
+            backend.write_all(b"pong!").await.unwrap();
+            backend.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).await.unwrap();
+            assert_eq!(buf, b"pong!");
+        };
+        let relayed = relay(&mut inbound, &mut outbound, Duration::from_secs(5), &sent, &received);
+        let (result, ()) = tokio::join!(relayed, peers);
+
+        assert!(!result.unwrap());
+        assert_eq!((sent.load(Ordering::Relaxed), received.load(Ordering::Relaxed)), (4, 5));
+    }
+
+    #[tokio::test]
+    async fn relay_closes_idle_connection() {
+        let (_client, mut inbound) = tcp_pair().await;
+        let (mut outbound, _backend) = tcp_pair().await;
+        let (sent, received) = (AtomicU64::new(0), AtomicU64::new(0));
+
+        let started = Instant::now();
+        let result = relay(&mut inbound, &mut outbound, Duration::from_millis(200), &sent, &received).await;
+
+        assert!(result.unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn active_guard_counts_and_releases() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = ActiveGuard::new(counter.clone());
+        let second = ActiveGuard::new(counter.clone());
+        assert_eq!((first.count, second.count), (1, 2));
+        drop(first);
+        assert_eq!(ActiveGuard::new(counter.clone()).count, 2);
+        drop(second);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }

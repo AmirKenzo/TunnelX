@@ -22,3 +22,7 @@ targets = [
     "104.16.0.1:443",
     "104.17.0.1:443",
 ]
+# Optional per-rule connection settings (any [[forward]] rule; defaults shown):
+#   idle_timeout_secs = 300    # close after this long with no traffic; 0 disables
+#   keepalive_secs = 60        # TCP keepalive idle time on both sides; 0 disables
+#   max_connections = 100000   # concurrent connections on this rule; 0 = unlimited

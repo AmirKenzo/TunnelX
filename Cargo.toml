@@ -1,6 +1,6 @@
 [package]
 name = "tunnelx"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 
 [[bin]]
@@ -24,6 +24,7 @@ rcgen = "0.13"
 tokio-tungstenite = "0.24"
 bytes = "1"
 rand = "0.8"
+socket2 = "0.6"
 yamux = "0.14"
 tokio-util = { version = "0.7", features = ["compat"] }
 

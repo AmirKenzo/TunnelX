@@ -18,6 +18,18 @@ fn default_max_sessions_per_tunnel() -> usize {
     8
 }
 
+fn default_idle_timeout_secs() -> u64 {
+    300
+}
+
+fn default_keepalive_secs() -> u64 {
+    60
+}
+
+fn default_max_connections() -> usize {
+    100_000
+}
+
 /// Top-level config. `mode` decides which of the three shapes below applies;
 /// it's optional and defaults to "direct" so existing direct-mode config
 /// files (no `mode` key) keep working unchanged.
@@ -100,6 +112,12 @@ pub struct ForwardRule {
     pub targets: Vec<String>,
     #[serde(default)]
     pub allowed_sni: Vec<String>,
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    #[serde(default = "default_keepalive_secs")]
+    pub keepalive_secs: u64,
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 }
 
 impl ForwardRule {
@@ -363,6 +381,20 @@ mod tests {
         let c = parse_direct("[[forward]]\nname = \"ssh\"\nlisten = \"0.0.0.0:2222\"\ntarget = \"1.2.3.4:22\"\n").unwrap();
         assert_eq!(c.forwards[0].target_pool(), vec!["1.2.3.4:22".to_string()]);
         assert!(c.forwards[0].allowed_sni.is_empty());
+    }
+
+    #[test]
+    fn connection_settings_defaults_and_overrides() {
+        let c = parse_direct("[[forward]]\nname = \"ssh\"\nlisten = \"0.0.0.0:2222\"\ntarget = \"1.2.3.4:22\"\n").unwrap();
+        let rule = &c.forwards[0];
+        assert_eq!((rule.idle_timeout_secs, rule.keepalive_secs, rule.max_connections), (300, 60, 100_000));
+
+        let c = parse_direct(
+            "[[forward]]\nname = \"ssh\"\nlisten = \"0.0.0.0:2222\"\ntarget = \"1.2.3.4:22\"\nidle_timeout_secs = 0\nkeepalive_secs = 30\nmax_connections = 10\n",
+        )
+        .unwrap();
+        let rule = &c.forwards[0];
+        assert_eq!((rule.idle_timeout_secs, rule.keepalive_secs, rule.max_connections), (0, 30, 10));
     }
 
     #[test]

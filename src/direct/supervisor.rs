@@ -108,6 +108,9 @@ async fn reload(active: &mut HashMap<String, ActiveRule>, registry: &Registry, n
             Some(existing) if existing.allowed_sni != rule.allowed_sni => {
                 info!(name = %name, old_allowed_sni = ?existing.allowed_sni, new_allowed_sni = ?rule.allowed_sni, "forward allowed_sni updated");
             }
+            Some(existing) if existing != rule => {
+                info!(name = %name, idle_timeout_secs = rule.idle_timeout_secs, keepalive_secs = rule.keepalive_secs, max_connections = rule.max_connections, "forward settings updated");
+            }
             _ => {}
         }
     }
