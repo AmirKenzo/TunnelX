@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -8,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use rand::seq::SliceRandom;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -135,7 +136,14 @@ async fn handle_connection(
         },
     };
 
-    let outbound = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&target)).await {
+    let local_addr = inbound.local_addr().ok();
+    let source = match rule.source_ip.as_deref() {
+        None => None,
+        Some("inbound") => local_addr.map(|a| a.ip()),
+        Some(ip) => ip.parse().ok(),
+    };
+
+    let outbound = match tokio::time::timeout(CONNECT_TIMEOUT, dial(&target, source)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             warn!(name = %name, peer = %peer_addr, target = %target, error = %e, "dial failed");
@@ -149,7 +157,15 @@ async fn handle_connection(
     let _ = outbound.set_nodelay(true);
     set_keepalive(&outbound, rule.keepalive_secs);
 
-    info!(name = %name, peer = %peer_addr, target = %target, sni = sni.as_deref(), "connection open");
+    info!(
+        name = %name,
+        peer = %peer_addr,
+        local = local_addr.map(tracing::field::display),
+        source = source.map(tracing::field::display),
+        target = %target,
+        sni = sni.as_deref(),
+        "connection open"
+    );
     let started = Instant::now();
 
     let mut outbound = outbound;
@@ -191,6 +207,19 @@ async fn handle_connection(
             );
         }
     }
+}
+
+async fn dial(target: &str, source: Option<IpAddr>) -> io::Result<TcpStream> {
+    let target: SocketAddr = target
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let source = match source {
+        Some(ip) if ip.is_ipv4() == target.is_ipv4() => ip,
+        _ => return TcpStream::connect(target).await,
+    };
+    let socket = if target.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    socket.bind(SocketAddr::new(source, 0))?;
+    socket.connect(target).await
 }
 
 fn log_dropped(
@@ -409,9 +438,9 @@ mod tests {
 
     #[test]
     fn sni_exact() {
-        assert!(sni_matches("nativeplus.ir", "nativeplus.ir"));
-        assert!(!sni_matches("other.ir", "nativeplus.ir"));
-        assert!(!sni_matches("a.nativeplus.ir", "nativeplus.ir"));
+        assert!(sni_matches("example.com", "example.com"));
+        assert!(!sni_matches("other.com", "example.com"));
+        assert!(!sni_matches("a.example.com", "example.com"));
     }
 
     #[test]
@@ -425,9 +454,9 @@ mod tests {
 
     #[test]
     fn sni_case_and_trailing_dot() {
-        assert!(sni_matches("NativePlus.IR", "nativeplus.ir"));
+        assert!(sni_matches("Example.COM", "example.com"));
         assert!(sni_matches("A.Sni.Ir", "*.SNI.ir"));
-        assert!(sni_matches("nativeplus.ir.", "nativeplus.ir"));
+        assert!(sni_matches("example.com.", "example.com"));
         assert!(sni_matches("a.sni.ir.", "*.sni.ir"));
     }
 
@@ -486,5 +515,23 @@ mod tests {
         assert_eq!(ActiveGuard::new(counter.clone()).count, 2);
         drop(second);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn dial_binds_requested_source_ip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+
+        let _plain = dial(&target, None).await.unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer.ip().to_string(), "127.0.0.1");
+
+        let _bound = dial(&target, Some("127.0.0.2".parse().unwrap())).await.unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer.ip().to_string(), "127.0.0.2");
+
+        let _mismatch = dial(&target, Some("::1".parse().unwrap())).await.unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert!(peer.ip().is_ipv4());
     }
 }

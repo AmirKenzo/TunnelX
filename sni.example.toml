@@ -26,3 +26,5 @@ targets = [
 #   idle_timeout_secs = 300    # close after this long with no traffic; 0 disables
 #   keepalive_secs = 60        # TCP keepalive idle time on both sides; 0 disables
 #   max_connections = 100000   # concurrent connections on this rule; 0 = unlimited
+#   source_ip = "inbound"      # dial the target from the local IP the client connected to
+#                              # (or a fixed IP, e.g. "203.0.113.10"); unset = OS default

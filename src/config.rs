@@ -118,6 +118,8 @@ pub struct ForwardRule {
     pub keepalive_secs: u64,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    #[serde(default)]
+    pub source_ip: Option<String>,
 }
 
 impl ForwardRule {
@@ -159,6 +161,15 @@ impl DirectConfig {
                 target.parse::<std::net::SocketAddr>().with_context(|| {
                     format!("forward '{}': invalid target address '{}'", rule.name, target)
                 })?;
+            }
+            if let Some(source_ip) = &rule.source_ip {
+                if source_ip != "inbound" && source_ip.parse::<std::net::IpAddr>().is_err() {
+                    bail!(
+                        "forward '{}': invalid source_ip '{}' (expected \"inbound\" or an IP address)",
+                        rule.name,
+                        source_ip
+                    );
+                }
             }
             for pattern in &rule.allowed_sni {
                 let valid = match pattern.strip_prefix("*.") {
@@ -395,6 +406,18 @@ mod tests {
         .unwrap();
         let rule = &c.forwards[0];
         assert_eq!((rule.idle_timeout_secs, rule.keepalive_secs, rule.max_connections), (0, 30, 10));
+    }
+
+    #[test]
+    fn source_ip_validation() {
+        let base = "[[forward]]\nname = \"cf\"\nlisten = \"0.0.0.0:3300\"\ntarget = \"1.1.1.1:443\"\n";
+        assert_eq!(parse_direct(base).unwrap().forwards[0].source_ip, None);
+        for ok in ["inbound", "203.0.113.10", "::1"] {
+            assert!(parse_direct(&format!("{base}source_ip = \"{ok}\"\n")).is_ok(), "{ok}");
+        }
+        for bad in ["", "auto", "203.0.113.10:443"] {
+            assert!(parse_direct(&format!("{base}source_ip = \"{bad}\"\n")).is_err(), "{bad}");
+        }
     }
 
     #[test]
